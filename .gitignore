@@ -1,0 +1,6 @@
+# Runtime files (state lives in the Actions cache)
+state.json
+state.json.tmp
+*-page.html
+__pycache__/
+*.pyc

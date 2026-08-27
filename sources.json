@@ -1,0 +1,28 @@
+[
+  {
+    "id": "fpf",
+    "name": "Seleção Portugal (FPF)",
+    "url": "https://bilheteira.fpf.pt/",
+    "keywords": ["portugal"],
+    "exclude_keywords": []
+  },
+  {
+    "id": "sporting",
+    "name": "Sporting CP (futebol)",
+    "url": "https://tickets.sporting.pt/pt",
+    "keywords": [],
+    "exclude_keywords": [
+      "futsal", "andebol", "voleibol", "volei", "vólei",
+      "hóquei", "hoquei", "basquetebol", "basquete", "basket",
+      "atletismo", "ténis", "tenis", "natação", "natacao",
+      "rugby", "esports", "e-sports", "modalidades",
+      "feminino", "feminina",
+      "sub-23", "sub-21", "sub-20", "sub-19", "sub-17", "sub-15", "sub-13",
+      "sub 23", "sub 21", "sub 19",
+      "juniores", "juvenis", "juvenil", "iniciados", "infantis",
+      "formação", "formacao", "revelação", "revelacao", "academia",
+      "sporting b", "equipa b",
+      "tour", "museu", "visita", "estádio tour", "estadio tour"
+    ]
+  }
+]
