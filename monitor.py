@@ -688,6 +688,9 @@ def run_diagnostic(cfg: Config, dump_file: str | None) -> int:
             events = parse_events(page, src.browse_url, src)
             if not events:
                 _diag_hints(page)
+                _dump_html_context(page, ["Esgotado", "Comprar", "Betclic",
+                                          "SPORTING", "Bilhet", "Jogo Fora",
+                                          "20:15"])
             print(f"\nParsed {len(events)} candidate event link(s):\n")
         else:
             try:
@@ -713,6 +716,20 @@ def run_diagnostic(cfg: Config, dump_file: str | None) -> int:
         print(f"\nKeywords {kw}: {len(matched)} match; "
               f"available now: {sum(1 for e in matched if e.status == 'AVAILABLE')}")
     return 0
+
+
+def _dump_html_context(html: str, markers) -> None:
+    """Print raw-HTML windows around the first hit of each marker (to read the
+    DOM structure / class names of match cards in a rendered SPA)."""
+    print("\n--- HTML context around markers ---")
+    for mk in markers:
+        i = html.lower().find(mk.lower())
+        if i < 0:
+            print(f"[{mk}] not found")
+            continue
+        window = html[max(0, i - 260):i + 140]
+        print(f"[{mk}] …{window}…")
+    print("--- end context ---\n")
 
 
 def _diag_hints(page: str) -> None:
