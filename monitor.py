@@ -199,7 +199,8 @@ class Source:
 
     def __init__(self, id, name, url, keywords=None, exclude_keywords=None,
                  event_selector="", title_selector="", link_selector="",
-                 api_url="", api_type="html"):
+                 api_url="", api_type="html", browse_url="",
+                 wait_selector="", wait_ms=0):
         self.id = str(id).strip()
         self.name = str(name).strip() or self.id
         self.url = str(url).strip()
@@ -209,10 +210,13 @@ class Source:
         self.event_selector = (event_selector or "").strip()
         self.title_selector = (title_selector or "").strip()
         self.link_selector = (link_selector or "").strip()
-        # api_type "json": pull events from api_url (a JSON endpoint) instead of
-        # scraping the HTML page. Falls back to HTML scraping otherwise.
+        # api_type: "html" (scrape), "json" (fetch api_url), or "browser"
+        # (render the page with a headless browser, then scrape the DOM).
         self.api_url = (api_url or "").strip()
         self.api_type = (api_type or "html").strip().lower()
+        self.browse_url = (browse_url or "").strip() or self.url
+        self.wait_selector = (wait_selector or "").strip()
+        self.wait_ms = int(wait_ms or 0)
 
 
 def _sources_from_env() -> list[Source] | None:
@@ -539,11 +543,40 @@ def parse_json_events(data, src: "Source") -> list[Event]:
     return events
 
 
+def render_with_browser(url: str, wait_selector: str = "", wait_ms: int = 0) -> str:
+    """Render a JS page with headless Chromium and return the final HTML."""
+    from playwright.sync_api import sync_playwright  # lazy: only browser sources
+
+    launch: dict = {"headless": True, "args": ["--no-sandbox",
+                                               "--disable-dev-shm-usage"]}
+    exe = os.environ.get("PW_CHROMIUM", "").strip()
+    if exe:
+        launch["executable_path"] = exe
+    with sync_playwright() as p:
+        browser = p.chromium.launch(**launch)
+        try:
+            page = browser.new_page(user_agent=USER_AGENT, locale="pt-PT")
+            page.goto(url, wait_until="networkidle", timeout=45000)
+            if wait_selector:
+                try:
+                    page.wait_for_selector(wait_selector, timeout=15000)
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+            if wait_ms:
+                page.wait_for_timeout(wait_ms)
+            return page.content()
+        finally:
+            browser.close()
+
+
 def load_events(src: "Source") -> list[Event]:
-    """Fetch and parse events for a source (JSON API or HTML scrape)."""
+    """Fetch and parse events for a source (JSON API, browser render, or HTML)."""
     if src.api_type == "json" and src.api_url:
         raw = fetch(src.api_url, accept="application/json, text/plain, */*")
         return parse_json_events(json.loads(raw), src)
+    if src.api_type == "browser":
+        html = render_with_browser(src.browse_url, src.wait_selector, src.wait_ms)
+        return parse_events(html, src.browse_url, src)
     page = fetch(src.url)
     return parse_events(page, src.url, src)
 
@@ -639,6 +672,23 @@ def run_diagnostic(cfg: Config, dump_file: str | None) -> int:
                 print(f"JSON parse failed: {err}")
                 continue
             print(f"\nParsed {len(events)} event(s):\n")
+        elif src.api_type == "browser":
+            try:
+                page = render_with_browser(src.browse_url, src.wait_selector,
+                                           src.wait_ms)
+            except Exception as err:  # noqa: BLE001
+                print(f"RENDER FAILED: {err}")
+                continue
+            print(f"Rendered {len(page)} bytes")
+            if dump_file:
+                out = f"{src.id}-{dump_file}"
+                with open(out, "w", encoding="utf-8") as fh:
+                    fh.write(page)
+                print(f"Rendered HTML written to {out}")
+            events = parse_events(page, src.browse_url, src)
+            if not events:
+                _diag_hints(page)
+            print(f"\nParsed {len(events)} candidate event link(s):\n")
         else:
             try:
                 page = fetch(src.url)
