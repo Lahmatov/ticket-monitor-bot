@@ -15,6 +15,7 @@
     "api_type": "browser",
     "browse_url": "https://tickets.sporting.pt/pt",
     "wait_ms": 4000,
+    "parser": "sporting",
     "keywords": [],
     "exclude_keywords": [
       "futsal", "andebol", "voleibol", "volei", "vólei",

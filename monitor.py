@@ -200,7 +200,7 @@ class Source:
     def __init__(self, id, name, url, keywords=None, exclude_keywords=None,
                  event_selector="", title_selector="", link_selector="",
                  api_url="", api_type="html", browse_url="",
-                 wait_selector="", wait_ms=0):
+                 wait_selector="", wait_ms=0, parser=""):
         self.id = str(id).strip()
         self.name = str(name).strip() or self.id
         self.url = str(url).strip()
@@ -217,6 +217,8 @@ class Source:
         self.browse_url = (browse_url or "").strip() or self.url
         self.wait_selector = (wait_selector or "").strip()
         self.wait_ms = int(wait_ms or 0)
+        # Optional site-specific DOM parser (e.g. "sporting").
+        self.parser = (parser or "").strip().lower()
 
 
 def _sources_from_env() -> list[Source] | None:
@@ -569,6 +571,45 @@ def render_with_browser(url: str, wait_selector: str = "", wait_ms: int = 0) -> 
             browser.close()
 
 
+def parse_sporting_dom(html: str, src: "Source") -> list[Event]:
+    """Parse tickets.sporting.pt rendered DOM (Angular 'game' cards)."""
+    soup = BeautifulSoup(html, "html.parser")
+    events: list[Event] = []
+    for cont in soup.select(".game-clubs-container"):
+        names: list[str] = []
+        for club in cont.select(".game-club"):
+            sp = club.find("span")
+            txt = _norm_ws(sp.get_text(" ", strip=True)) if sp else ""
+            if txt:
+                names.append(txt)
+        if len(names) < 2:
+            continue
+        title = f"{names[0]} x {names[1]}"
+        time_el = cont.select_one(".game-time span")
+        time_txt = _norm_ws(time_el.get_text()) if time_el else ""
+        # Climb to the match card: the smallest ancestor that includes this
+        # match's buy/sold button, without swallowing a sibling match.
+        card = cont
+        for _ in range(8):
+            parent = card.parent
+            if parent is None or len(parent.select(".game-clubs-container")) > 1:
+                break
+            card = parent
+            if card.select_one(".p-button-label, button"):
+                break
+        card_text = _norm_ws(card.get_text(" ", strip=True))
+        label_el = card.select_one(".p-button-label")
+        label = _norm_ws(label_el.get_text()) if label_el else card_text
+        status = classify_status(label, has_buy_link=("comprar" in label.lower()))
+        comp_el = card.select_one(".competition, .game-competition")
+        comp = _norm_ws(comp_el.get_text(" ", strip=True)) if comp_el else ""
+        date = _extract_date(card_text)
+        context = _norm_ws(f"{title} {comp} {time_txt} {card_text}")[:400]
+        eid = _event_id("", f"{title}-{comp}")
+        events.append(Event(eid, title, src.browse_url, date or None, status, context))
+    return events
+
+
 def load_events(src: "Source") -> list[Event]:
     """Fetch and parse events for a source (JSON API, browser render, or HTML)."""
     if src.api_type == "json" and src.api_url:
@@ -576,6 +617,8 @@ def load_events(src: "Source") -> list[Event]:
         return parse_json_events(json.loads(raw), src)
     if src.api_type == "browser":
         html = render_with_browser(src.browse_url, src.wait_selector, src.wait_ms)
+        if src.parser == "sporting":
+            return parse_sporting_dom(html, src)
         return parse_events(html, src.browse_url, src)
     page = fetch(src.url)
     return parse_events(page, src.url, src)
@@ -685,7 +728,10 @@ def run_diagnostic(cfg: Config, dump_file: str | None) -> int:
                 with open(out, "w", encoding="utf-8") as fh:
                     fh.write(page)
                 print(f"Rendered HTML written to {out}")
-            events = parse_events(page, src.browse_url, src)
+            if src.parser == "sporting":
+                events = parse_sporting_dom(page, src)
+            else:
+                events = parse_events(page, src.browse_url, src)
             if not events:
                 _diag_hints(page)
                 _dump_html_context(page, ["Esgotado", "Comprar", "Betclic",
