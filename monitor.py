@@ -198,7 +198,8 @@ class Source:
     """One ticketing site to watch."""
 
     def __init__(self, id, name, url, keywords=None, exclude_keywords=None,
-                 event_selector="", title_selector="", link_selector=""):
+                 event_selector="", title_selector="", link_selector="",
+                 api_url="", api_type="html"):
         self.id = str(id).strip()
         self.name = str(name).strip() or self.id
         self.url = str(url).strip()
@@ -208,6 +209,10 @@ class Source:
         self.event_selector = (event_selector or "").strip()
         self.title_selector = (title_selector or "").strip()
         self.link_selector = (link_selector or "").strip()
+        # api_type "json": pull events from api_url (a JSON endpoint) instead of
+        # scraping the HTML page. Falls back to HTML scraping otherwise.
+        self.api_url = (api_url or "").strip()
+        self.api_type = (api_type or "html").strip().lower()
 
 
 def _sources_from_env() -> list[Source] | None:
@@ -308,11 +313,11 @@ def should_act(now_lisbon: datetime, state: dict) -> tuple[bool, bool]:
 # --------------------------------------------------------------------------- #
 
 
-def fetch(url: str) -> str:
+def fetch(url: str, accept: str = "text/html,application/xhtml+xml") -> str:
     headers = {
         "User-Agent": USER_AGENT,
         "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml",
+        "Accept": accept,
     }
     last_err: Exception | None = None
     for attempt in range(1, REQUEST_RETRIES + 1):
@@ -465,6 +470,84 @@ def parse_events(page_html: str, base_url: str, src: "Source") -> list[Event]:
     return parse_events_heuristic(soup, base_url)
 
 
+_JSON_TITLE_KEYS = ("name", "title", "designation", "eventname", "description",
+                    "designacao", "designação", "nome", "evento")
+_JSON_DATE_KEYS = ("date", "eventdate", "startdate", "datestart", "sessiondate",
+                   "data", "datahora", "dataevento", "datainicio")
+_JSON_ID_KEYS = ("id", "eventid", "code", "codigo", "slug", "guid")
+_JSON_URL_KEYS = ("url", "link", "detailurl", "ligacao", "href")
+_JSON_STATUS_KEYS = ("status", "state", "estado", "availability", "disponibilidade",
+                     "onsale", "available", "disponivel", "salesopen", "isonsale",
+                     "situacao")
+
+
+def _first_str(d: dict, keys) -> str:
+    for k, v in d.items():
+        if k.lower() in keys and isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _json_status(item: dict) -> str:
+    for k, v in item.items():
+        if k.lower() not in _JSON_STATUS_KEYS:
+            continue
+        if isinstance(v, bool):
+            return "AVAILABLE" if v else "SOLD_OUT"
+        if isinstance(v, str):
+            s = classify_status(v, has_buy_link=False)
+            if s != "UNKNOWN":
+                return s
+    # No explicit status: this endpoint lists sellable/announced events, so
+    # presence means it's worth notifying about.
+    return "AVAILABLE"
+
+
+def _iter_json_items(data):
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        for key in ("data", "items", "events", "eventos", "result", "results",
+                    "value", "list", "d"):
+            for k, v in data.items():
+                if k.lower() == key and isinstance(v, list):
+                    return [x for x in v if isinstance(x, dict)]
+        # a single event object
+        return [data]
+    return []
+
+
+def parse_json_events(data, src: "Source") -> list[Event]:
+    events: list[Event] = []
+    for item in _iter_json_items(data):
+        title = _first_str(item, _JSON_TITLE_KEYS)
+        if not title:
+            # build from home/away teams if present
+            home = _first_str(item, ("hometeam", "home", "equipacasa", "casa"))
+            away = _first_str(item, ("awayteam", "away", "equipavisitante", "fora"))
+            if home or away:
+                title = f"{home} x {away}".strip(" x")
+        context = _norm_ws(json.dumps(item, ensure_ascii=False).lower())
+        if not title:
+            title = context[:80]
+        date = _first_str(item, _JSON_DATE_KEYS)
+        rel = _first_str(item, _JSON_URL_KEYS)
+        url = urljoin(src.url, rel) if rel else src.url
+        eid = _first_str(item, _JSON_ID_KEYS) or _event_id(url, title)
+        events.append(Event(str(eid), title, url, date or None,
+                            _json_status(item), context[:400]))
+    return events
+
+
+def load_events(src: "Source") -> list[Event]:
+    """Fetch and parse events for a source (JSON API or HTML scrape)."""
+    if src.api_type == "json" and src.api_url:
+        raw = fetch(src.api_url, accept="application/json, text/plain, */*")
+        return parse_json_events(json.loads(raw), src)
+    page = fetch(src.url)
+    return parse_events(page, src.url, src)
+
+
 def matches_keywords(event: Event, src: "Source") -> bool:
     """True if the event passes the source's include AND exclude filters."""
     hay = f"{event.title} {event.context}".lower()
@@ -541,22 +624,37 @@ def set_output(name: str, value: str) -> None:
 
 def run_diagnostic(cfg: Config, dump_file: str | None) -> int:
     for src in cfg.sources:
-        print(f"\n{'=' * 70}\nSOURCE: {src.name} [{src.id}] -> {src.url}\n{'=' * 70}")
-        try:
-            page = fetch(src.url)
-        except Exception as err:  # noqa: BLE001
-            print(f"FETCH FAILED: {err}")
-            continue
-        print(f"Fetched {len(page)} bytes")
-        if dump_file:
-            out = f"{src.id}-{dump_file}"
-            with open(out, "w", encoding="utf-8") as fh:
-                fh.write(page)
-            print(f"Raw HTML written to {out}")
-        if not parse_events(page, src.url, src):
-            _diag_hints(page)
-        events = parse_events(page, src.url, src)
-        print(f"\nParsed {len(events)} candidate event link(s):\n")
+        target = src.api_url if (src.api_type == "json" and src.api_url) else src.url
+        print(f"\n{'=' * 70}\nSOURCE: {src.name} [{src.id}] ({src.api_type}) -> {target}\n{'=' * 70}")
+        if src.api_type == "json" and src.api_url:
+            try:
+                raw = fetch(src.api_url, accept="application/json, text/plain, */*")
+            except Exception as err:  # noqa: BLE001
+                print(f"FETCH FAILED: {err}")
+                continue
+            print(f"Fetched {len(raw)} bytes of JSON; head: {raw[:300]}")
+            try:
+                events = parse_json_events(json.loads(raw), src)
+            except Exception as err:  # noqa: BLE001
+                print(f"JSON parse failed: {err}")
+                continue
+            print(f"\nParsed {len(events)} event(s):\n")
+        else:
+            try:
+                page = fetch(src.url)
+            except Exception as err:  # noqa: BLE001
+                print(f"FETCH FAILED: {err}")
+                continue
+            print(f"Fetched {len(page)} bytes")
+            if dump_file:
+                out = f"{src.id}-{dump_file}"
+                with open(out, "w", encoding="utf-8") as fh:
+                    fh.write(page)
+                print(f"Raw HTML written to {out}")
+            if not parse_events(page, src.url, src):
+                _diag_hints(page)
+            events = parse_events(page, src.url, src)
+            print(f"\nParsed {len(events)} candidate event link(s):\n")
         for ev in events:
             star = "  <-- keyword match" if matches_keywords(ev, src) else ""
             print(f"[{ev.status:9}] {ev.title[:70]!r} | {ev.date} | {ev.url}{star}")
@@ -741,8 +839,7 @@ def _process_source(cfg: Config, src: "Source", state: dict, now_iso: str) -> bo
     failures = state["failures"]
     dirty = False
     try:
-        page = fetch(src.url)
-        events = parse_events(page, src.url, src)
+        events = load_events(src)
     except Exception as err:  # noqa: BLE001 - handle any failure uniformly
         log.error("[%s] fetch/parse failed: %s", src.id, err)
         failures[src.id] = failures.get(src.id, 0) + 1

@@ -3,6 +3,8 @@
     "id": "fpf",
     "name": "Seleção Portugal (FPF)",
     "url": "https://bilheteira.fpf.pt/",
+    "api_type": "json",
+    "api_url": "https://bilheteira.fpf.pt/public/Event",
     "keywords": ["portugal"],
     "exclude_keywords": []
   },
