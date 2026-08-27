@@ -598,13 +598,43 @@ def _diag_hints(page: str) -> None:
     print("--- end inspection ---\n")
 
 
+_HOST_NOISE = ("angular.io", "google.com", "gstatic.com", "googleapis.com",
+               "w3.org", "cloudflare.com", "schema.org", "github.com",
+               "jquery.com", "mozilla.org", "npmjs.com", "microsoft.com",
+               "bootstrapcdn.com", "jsdelivr.net", "unpkg.com", "sentry.io",
+               "fontawesome.com", "youtube.com", "facebook.com", "example.com")
+
+
+def _probe_get(url: str) -> None:
+    """GET a candidate endpoint and print status/type/snippet (never raises)."""
+    headers = {"User-Agent": USER_AGENT,
+               "Accept": "application/json, text/plain, */*",
+               "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8"}
+    print(f"\n=== GET {url} ===")
+    try:
+        r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as err:
+        print("  request error:", err)
+        return
+    ctype = r.headers.get("content-type", "?")
+    print(f"  status={r.status_code}  type={ctype}  len={len(r.text)}")
+    print("  body (first 700 chars):", _norm_ws(r.text)[:700] or "(empty)")
+
+
 def run_probe(cfg: Config) -> int:
-    """Scan each source's JS bundles for API hosts / data endpoints."""
-    api_re = re.compile(r'https?://[a-z0-9.\-]+(?:/[a-zA-Z0-9_\-./]*)?', re.IGNORECASE)
-    path_re = re.compile(
-        r'["\'`](/[a-zA-Z0-9_\-./]*(?:api|event|evento|bilhet|ticket|sessao|'
-        r'sess\%C3\%A3o|game|jogo|match|calendar|agenda)[a-zA-Z0-9_\-./]*)["\'`]',
-        re.IGNORECASE)
+    """Scan each source's JS bundles for API hosts / data endpoints.
+
+    If PROBE_URL is set, just GET that URL and dump the response instead.
+    """
+    direct = os.environ.get("PROBE_URL", "").strip()
+    if direct:
+        for u in direct.split(","):
+            if u.strip():
+                _probe_get(u.strip())
+        return 0
+
+    host_re = re.compile(r'https?://([a-z0-9.\-]+)', re.IGNORECASE)
+    path_re = re.compile(r'["\'`](/[a-zA-Z][a-zA-Z0-9_\-./]{2,}(?:/[a-zA-Z0-9_\-.]+){1,})["\'`]')
     for src in cfg.sources:
         print(f"\n{'=' * 70}\nPROBE: {src.name} [{src.id}] -> {src.url}\n{'=' * 70}")
         try:
@@ -615,7 +645,8 @@ def run_probe(cfg: Config) -> int:
         soup = BeautifulSoup(page, "html.parser")
         scripts = [urljoin(src.url, s["src"])
                    for s in soup.find_all("script", src=True)]
-        hosts, paths = set(), set()
+        hosts: dict[str, int] = {}
+        paths: dict[str, int] = {}
         for js_url in scripts:
             if urlparse(js_url).netloc != urlparse(src.url).netloc:
                 continue  # only same-origin app bundles
@@ -625,20 +656,20 @@ def run_probe(cfg: Config) -> int:
                 print(f"  (could not fetch {js_url}: {err})")
                 continue
             print(f"  scanned {js_url} ({len(body)} bytes)")
-            for m in api_re.findall(body):
-                low = m.lower()
-                if any(k in low for k in
-                       ("api", "event", "bilhet", "ticket", "sessao", "jogo",
-                        "game", "match", "graphql", "calendar", "agenda")):
-                    hosts.add(m)
-            for m in path_re.findall(body):
-                paths.add(m)
-        print(f"\n  API-looking absolute URLs ({len(hosts)}):")
-        for h in sorted(hosts)[:40]:
-            print("     ", h)
-        print(f"  API-looking paths ({len(paths)}):")
-        for p in sorted(paths)[:40]:
-            print("     ", p)
+            for h in host_re.findall(body):
+                if not any(n in h.lower() for n in _HOST_NOISE):
+                    hosts[h] = hosts.get(h, 0) + 1
+            for p in path_re.findall(body):
+                paths[p] = paths.get(p, 0) + 1
+        print(f"\n  Non-noise hosts referenced ({len(hosts)}):")
+        for h, n in sorted(hosts.items(), key=lambda kv: -kv[1])[:30]:
+            print(f"      {n:5}x  {h}")
+        interesting = {p: n for p, n in paths.items() if re.search(
+            r'(api|event|evento|bilhet|ticket|sess|jogo|game|match|calendar|'
+            r'agenda|list|catalog|product|show)', p, re.IGNORECASE)}
+        print(f"  Interesting paths ({len(interesting)} of {len(paths)}):")
+        for p, n in sorted(interesting.items(), key=lambda kv: -kv[1])[:40]:
+            print(f"      {n:5}x  {p}")
     return 0
 
 

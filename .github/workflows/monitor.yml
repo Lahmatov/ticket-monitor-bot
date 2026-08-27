@@ -20,6 +20,10 @@ on:
         type: choice
         default: normal
         options: [normal, diagnostic, test, chatid, probe]
+      probe_url:
+        description: "In probe mode: GET this URL (comma-separated) and dump response"
+        type: string
+        default: ""
 
 concurrency:
   group: ticket-monitor
@@ -59,6 +63,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PROBE_URL: ${{ inputs.probe_url }}
         run: |
           python monitor.py --mode "${{ inputs.mode || 'normal' }}"
 
