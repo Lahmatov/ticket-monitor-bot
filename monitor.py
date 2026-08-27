@@ -598,6 +598,50 @@ def _diag_hints(page: str) -> None:
     print("--- end inspection ---\n")
 
 
+def run_probe(cfg: Config) -> int:
+    """Scan each source's JS bundles for API hosts / data endpoints."""
+    api_re = re.compile(r'https?://[a-z0-9.\-]+(?:/[a-zA-Z0-9_\-./]*)?', re.IGNORECASE)
+    path_re = re.compile(
+        r'["\'`](/[a-zA-Z0-9_\-./]*(?:api|event|evento|bilhet|ticket|sessao|'
+        r'sess\%C3\%A3o|game|jogo|match|calendar|agenda)[a-zA-Z0-9_\-./]*)["\'`]',
+        re.IGNORECASE)
+    for src in cfg.sources:
+        print(f"\n{'=' * 70}\nPROBE: {src.name} [{src.id}] -> {src.url}\n{'=' * 70}")
+        try:
+            page = fetch(src.url)
+        except Exception as err:  # noqa: BLE001
+            print(f"FETCH FAILED: {err}")
+            continue
+        soup = BeautifulSoup(page, "html.parser")
+        scripts = [urljoin(src.url, s["src"])
+                   for s in soup.find_all("script", src=True)]
+        hosts, paths = set(), set()
+        for js_url in scripts:
+            if urlparse(js_url).netloc != urlparse(src.url).netloc:
+                continue  # only same-origin app bundles
+            try:
+                body = fetch(js_url)
+            except Exception as err:  # noqa: BLE001
+                print(f"  (could not fetch {js_url}: {err})")
+                continue
+            print(f"  scanned {js_url} ({len(body)} bytes)")
+            for m in api_re.findall(body):
+                low = m.lower()
+                if any(k in low for k in
+                       ("api", "event", "bilhet", "ticket", "sessao", "jogo",
+                        "game", "match", "graphql", "calendar", "agenda")):
+                    hosts.add(m)
+            for m in path_re.findall(body):
+                paths.add(m)
+        print(f"\n  API-looking absolute URLs ({len(hosts)}):")
+        for h in sorted(hosts)[:40]:
+            print("     ", h)
+        print(f"  API-looking paths ({len(paths)}):")
+        for p in sorted(paths)[:40]:
+            print("     ", p)
+    return 0
+
+
 def run_chatid(cfg: Config) -> int:
     """Print chat ids seen in recent updates (message the bot first)."""
     if not cfg.telegram_token:
@@ -746,7 +790,7 @@ def _maybe_alert_failure(cfg: Config, src: "Source", n: int, err: Exception) -> 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="FPF ticket monitor")
     parser.add_argument("--mode",
-                        choices=("normal", "diagnostic", "test", "chatid"),
+                        choices=("normal", "diagnostic", "test", "chatid", "probe"),
                         default="normal")
     parser.add_argument("--dump-file", default="page.html",
                         help="Diagnostic mode writes <source_id>-<dump-file>.")
@@ -761,6 +805,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.mode == "diagnostic":
         return run_diagnostic(cfg, args.dump_file)
+    if args.mode == "probe":
+        return run_probe(cfg)
     if args.mode == "chatid":
         return run_chatid(cfg)
     if args.mode == "test":

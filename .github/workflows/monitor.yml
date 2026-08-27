@@ -19,7 +19,7 @@ on:
         description: "Run mode"
         type: choice
         default: normal
-        options: [normal, diagnostic, test, chatid]
+        options: [normal, diagnostic, test, chatid, probe]
 
 concurrency:
   group: ticket-monitor
