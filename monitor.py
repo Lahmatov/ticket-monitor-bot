@@ -553,6 +553,8 @@ def run_diagnostic(cfg: Config, dump_file: str | None) -> int:
             with open(out, "w", encoding="utf-8") as fh:
                 fh.write(page)
             print(f"Raw HTML written to {out}")
+        if not parse_events(page, src.url, src):
+            _diag_hints(page)
         events = parse_events(page, src.url, src)
         print(f"\nParsed {len(events)} candidate event link(s):\n")
         for ev in events:
@@ -563,6 +565,37 @@ def run_diagnostic(cfg: Config, dump_file: str | None) -> int:
         print(f"\nKeywords {kw}: {len(matched)} match; "
               f"available now: {sum(1 for e in matched if e.status == 'AVAILABLE')}")
     return 0
+
+
+def _diag_hints(page: str) -> None:
+    """When 0 events parse, print clues about how the page loads its data."""
+    soup = BeautifulSoup(page, "html.parser")
+    print("\n--- 0 events: inspecting page ---")
+    # SPA / framework markers
+    markers = ["__NEXT_DATA__", "window.__INITIAL_STATE__", "__NUXT__",
+               "ng-version", "data-reactroot", "id=\"root\"", "id=\"app\"",
+               "<app-root", "vue", "Blazor", "stimulus"]
+    found = [m for m in markers if m.lower() in page.lower()]
+    print("SPA markers:", found or "none obvious")
+    # script sources (often reveal the API host / framework)
+    srcs = [s.get("src") for s in soup.find_all("script", src=True)]
+    print(f"{len(srcs)} external scripts; first few:")
+    for s in srcs[:8]:
+        print("   ", s)
+    # anything that looks like an API / data endpoint
+    hits = sorted(set(re.findall(r'["\'](/[^"\']*(?:api|json|event|bilhet|ticket)[^"\']*)["\']',
+                                 page, re.IGNORECASE)))
+    print(f"candidate data paths ({len(hits)}):")
+    for h in hits[:20]:
+        print("   ", h)
+    absurls = sorted(set(re.findall(r'https?://[^\s"\'<>]*(?:api|graphql)[^\s"\'<>]*',
+                                    page, re.IGNORECASE)))
+    for u in absurls[:10]:
+        print("    URL:", u)
+    # a readable slice of the body text
+    text = _norm_ws(soup.get_text(" ", strip=True))
+    print("body text (first 400 chars):", text[:400] or "(empty)")
+    print("--- end inspection ---\n")
 
 
 def run_chatid(cfg: Config) -> int:
