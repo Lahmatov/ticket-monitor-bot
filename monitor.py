@@ -621,16 +621,37 @@ def _probe_get(url: str) -> None:
     print("  body (first 700 chars):", _norm_ws(r.text)[:700] or "(empty)")
 
 
+def _probe_grep(url: str, term: str) -> None:
+    """Download url and print context windows around each occurrence of term."""
+    print(f"\n=== GREP {term!r} in {url} ===")
+    try:
+        body = fetch(url)
+    except Exception as err:  # noqa: BLE001
+        print("  fetch failed:", err)
+        return
+    idxs = [m.start() for m in re.finditer(re.escape(term), body)]
+    print(f"  {len(idxs)} occurrence(s) in {len(body)} bytes")
+    for i in idxs[:12]:
+        snippet = body[max(0, i - 160):i + 160].replace("\n", " ")
+        print("   …", snippet, "…")
+
+
 def run_probe(cfg: Config) -> int:
     """Scan each source's JS bundles for API hosts / data endpoints.
 
     If PROBE_URL is set, just GET that URL and dump the response instead.
     """
     direct = os.environ.get("PROBE_URL", "").strip()
+    grep = os.environ.get("PROBE_GREP", "").strip()
     if direct:
         for u in direct.split(","):
-            if u.strip():
-                _probe_get(u.strip())
+            u = u.strip()
+            if not u:
+                continue
+            if grep:
+                _probe_grep(u, grep)
+            else:
+                _probe_get(u)
         return 0
 
     host_re = re.compile(r'https?://([a-z0-9.\-]+)', re.IGNORECASE)
