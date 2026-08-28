@@ -346,15 +346,16 @@ def fetch(url: str, accept: str = "text/html,application/xhtml+xml") -> str:
 
 
 class Event:
-    __slots__ = ("id", "title", "url", "date", "status", "context")
+    __slots__ = ("id", "title", "url", "date", "status", "context", "extra")
 
-    def __init__(self, id_, title, url, date, status, context):
+    def __init__(self, id_, title, url, date, status, context, extra=""):
         self.id = id_
         self.title = title
         self.url = url
         self.date = date
         self.status = status
         self.context = context
+        self.extra = extra  # optional secondary line (competition, time, …)
 
     def __repr__(self) -> str:
         return f"<Event {self.status} {self.title!r} {self.date} {self.url}>"
@@ -540,8 +541,11 @@ def parse_json_events(data, src: "Source") -> list[Event]:
         rel = _first_str(item, _JSON_URL_KEYS)
         url = urljoin(src.url, rel) if rel else src.url
         eid = _first_str(item, _JSON_ID_KEYS) or _event_id(url, title)
+        comp = _first_str(item, ("competition", "competicao", "competição",
+                                 "stage", "phase", "venue", "local", "stadium",
+                                 "estadio", "location"))
         events.append(Event(str(eid), title, url, date or None,
-                            _json_status(item), context[:400]))
+                            _json_status(item), context[:400], extra=comp))
     return events
 
 
@@ -604,9 +608,11 @@ def parse_sporting_dom(html: str, src: "Source") -> list[Event]:
         comp_el = card.select_one(".competition, .game-competition")
         comp = _norm_ws(comp_el.get_text(" ", strip=True)) if comp_el else ""
         date = _extract_date(card_text)
+        when = ", ".join(x for x in (date, time_txt) if x) or None
         context = _norm_ws(f"{title} {comp} {time_txt} {card_text}")[:400]
         eid = _event_id("", f"{title}-{comp}")
-        events.append(Event(eid, title, src.browse_url, date or None, status, context))
+        events.append(Event(eid, title, src.browse_url, when, status, context,
+                            extra=comp))
     return events
 
 
@@ -669,6 +675,8 @@ def _esc(text: str) -> str:
 def format_notification(event: Event, source_name: str) -> str:
     lines = [f"\U0001F3AB <b>Bilhetes à venda!</b> — {_esc(source_name)}",
              "", f"<b>{_esc(event.title)}</b>"]
+    if event.extra:
+        lines.append(f"\U0001F3C6 {_esc(event.extra)}")
     if event.date:
         lines.append(f"\U0001F4C5 {_esc(event.date)}")
     if event.url:
