@@ -62,8 +62,9 @@ from bs4 import BeautifulSoup
 
 LISBON = ZoneInfo("Europe/Lisbon")
 
-# Night runs (Lisbon 00:00-07:00) act at most this often.
-NIGHT_MIN_INTERVAL_MIN = 105  # ~2h, with slack for cron jitter
+# Minimum spacing between checks (enforced here, not by cron).
+DAY_MIN_INTERVAL_MIN = 38     # ~40 min during the day (slack for cron jitter)
+NIGHT_MIN_INTERVAL_MIN = 115  # ~2h at night (Lisbon 00:00-07:00)
 
 # Network
 REQUEST_TIMEOUT = 25
@@ -263,6 +264,9 @@ class Config:
         self.state_file = os.environ.get("STATE_FILE", "state.json").strip()
         self.telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         self.telegram_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        # Send a summary of every check (even when nothing is on sale).
+        self.report_every_run = os.environ.get("REPORT_EVERY_RUN", "").strip().lower() \
+            in ("1", "true", "yes", "on")
         self.sources = load_sources()
 
 
@@ -278,7 +282,7 @@ def load_state(path: str) -> dict:
     except (FileNotFoundError, json.JSONDecodeError):
         data = {}
     data.setdefault("notified", {})  # event_id -> {title,url,first_notified,last_seen}
-    data.setdefault("last_night_check_utc", None)
+    data.setdefault("last_check_utc", None)  # min-interval gate (day/night)
     data.setdefault("failures", {})  # source_id -> consecutive failure count
     return data
 
@@ -296,22 +300,17 @@ def save_state(path: str, state: dict) -> None:
 
 
 def should_act(now_lisbon: datetime, state: dict) -> tuple[bool, bool]:
-    """Return (act, is_night). Enforces the day/night cadence, DST-correct."""
-    hour = now_lisbon.hour
-    is_night = hour < 7  # 00:00-06:59 Lisbon
-    if not is_night:
-        return True, False
-    last = _parse_iso(state.get("last_night_check_utc"))
+    """Return (act, is_night). Enforces the day/night min-interval, DST-correct."""
+    is_night = now_lisbon.hour < 7  # 00:00-06:59 Lisbon
+    interval = NIGHT_MIN_INTERVAL_MIN if is_night else DAY_MIN_INTERVAL_MIN
+    last = _parse_iso(state.get("last_check_utc"))
     if last is not None:
         elapsed_min = (_now_utc() - last).total_seconds() / 60.0
-        if elapsed_min < NIGHT_MIN_INTERVAL_MIN:
-            log.info(
-                "Night run skipped: only %.0f min since last night check (< %d).",
-                elapsed_min,
-                NIGHT_MIN_INTERVAL_MIN,
-            )
-            return False, True
-    return True, True
+        if elapsed_min < interval:
+            log.info("Run skipped: only %.0f min since last check (< %d).",
+                     elapsed_min, interval)
+            return False, is_night
+    return True, is_night
 
 
 # --------------------------------------------------------------------------- #
@@ -961,8 +960,33 @@ def run_test(cfg: Config) -> int:
     return 0 if ok else 1
 
 
-def _process_source(cfg: Config, src: "Source", state: dict, now_iso: str) -> bool:
-    """Check one source; return True if state changed."""
+_STATUS_LABEL = {
+    "AVAILABLE": "🟢 в продаже",
+    "SOLD_OUT": "🔴 распродано",
+    "SOON": "🟡 скоро",
+    "UNKNOWN": "⚪️ статус неясен",
+}
+
+
+def _summary_lines(src: "Source", matched: list) -> list[str]:
+    """Human-readable report lines for one source (for the per-run heartbeat)."""
+    lines = [f"<b>{_esc(src.name)}</b>: {len(matched)} матч(ей)"]
+    if not matched:
+        lines.append("• подходящих матчей нет")
+        return lines
+    for ev in matched:
+        parts = [f"{_STATUS_LABEL.get(ev.status, ev.status)}: {ev.title}"]
+        if ev.extra:
+            parts.append(ev.extra)
+        if ev.date:
+            parts.append(ev.date)
+        lines.append("• " + _esc(" · ".join(parts)))
+    return lines
+
+
+def _process_source(cfg: Config, src: "Source", state: dict,
+                    now_iso: str) -> tuple[bool, list[str]]:
+    """Check one source; return (state_changed, report_lines)."""
     notified = state["notified"]
     failures = state["failures"]
     dirty = False
@@ -972,7 +996,8 @@ def _process_source(cfg: Config, src: "Source", state: dict, now_iso: str) -> bo
         log.error("[%s] fetch/parse failed: %s", src.id, err)
         failures[src.id] = failures.get(src.id, 0) + 1
         _maybe_alert_failure(cfg, src, failures[src.id], err)
-        return True  # persist the failure counter
+        return True, [f"<b>{_esc(src.name)}</b>: ⚠️ ошибка чтения "
+                      f"({_esc(str(err)[:80])})"]
 
     if failures.get(src.id):
         failures[src.id] = 0
@@ -1005,25 +1030,29 @@ def _process_source(cfg: Config, src: "Source", state: dict, now_iso: str) -> bo
         elif entry is not None:
             entry["last_seen"] = now_iso  # still listed, not buyable -> keep fresh
             dirty = True
-    return dirty
+    return dirty, _summary_lines(src, matched)
 
 
 def run_normal(cfg: Config) -> int:
     state = load_state(cfg.state_file)
     now_lisbon = datetime.now(LISBON)
-    act, is_night = should_act(now_lisbon, state)
+    act, _is_night = should_act(now_lisbon, state)
     if not act:
         return 0
 
-    dirty = False
-    if is_night:
-        state["last_night_check_utc"] = _now_utc().isoformat()
-        dirty = True
+    state["last_check_utc"] = _now_utc().isoformat()  # for the min-interval gate
+    dirty = True
 
     now_iso = _now_utc().isoformat()
+    report: list[str] = []
     for src in cfg.sources:
-        if _process_source(cfg, src, state, now_iso):
-            dirty = True
+        changed, lines = _process_source(cfg, src, state, now_iso)
+        dirty = dirty or changed
+        report.extend(lines)
+
+    if cfg.report_every_run:
+        header = f"🔎 <b>Проверка билетов</b> · {now_lisbon.strftime('%H:%M %d.%m')}"
+        telegram_send(cfg, header + "\n\n" + "\n".join(report))
 
     if _prune_state(state, now_iso):
         dirty = True

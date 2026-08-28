@@ -9,10 +9,11 @@ on:
     # the final day/night gating in Europe/Lisbon time, so these only need to be
     # a superset of the moments we want to act on.
     #
-    # Daytime (Lisbon ~07:00-00:00): every 20 minutes.
-    - cron: "0,20,40 6-23 * * *"
-    # Night (Lisbon ~00:00-07:00): a few passes; the script throttles to ~2h.
-    - cron: "0 0,2,4,6 * * *"
+    # Fire every 20 min; monitor.py gates to ~40 min by day / ~2 h at night
+    # (Europe/Lisbon, DST-correct). Day window in UTC covers WET & WEST.
+    - cron: "*/20 5-23 * * *"
+    # Night: hourly; the script throttles it to ~2 h.
+    - cron: "0 0,1,2,3,4 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -77,6 +78,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Send a summary of every check (set to "" to go back to quiet mode).
+          REPORT_EVERY_RUN: "1"
           PROBE_URL: ${{ inputs.probe_url }}
           PROBE_GREP: ${{ inputs.probe_grep }}
         run: |
