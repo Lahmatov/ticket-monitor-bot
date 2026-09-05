@@ -12,10 +12,9 @@
     "id": "sporting",
     "name": "Sporting CP (futebol)",
     "url": "https://tickets.sporting.pt/pt",
-    "api_type": "browser",
-    "browse_url": "https://tickets.sporting.pt/pt",
-    "wait_ms": 4000,
-    "parser": "sporting",
+    "api_type": "json",
+    "api_url": "https://tickets.sporting.pt/api/match/allopengames",
+    "parser": "sporting_api",
     "keywords": [],
     "exclude_keywords": [
       "futsal", "andebol", "voleibol", "volei", "vólei",

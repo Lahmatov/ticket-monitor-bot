@@ -605,6 +605,51 @@ def render_with_browser(url: str, wait_selector: str = "", wait_ms: int = 0,
             browser.close()
 
 
+def _fmt_iso_datetime(value: str) -> str:
+    """'2026-09-09T20:00:00' -> '09.09 20:00'; passthrough on failure."""
+    try:
+        dt = datetime.fromisoformat(value)
+        return dt.strftime("%d.%m %H:%M")
+    except (ValueError, TypeError):
+        return value or ""
+
+
+def parse_sporting_api(data, src: "Source") -> list[Event]:
+    """Parse tickets.sporting.pt /api/match/allopengames JSON (all open games)."""
+    games = []
+    if isinstance(data, dict):
+        d = data.get("data")
+        if isinstance(d, dict) and isinstance(d.get("openGames"), list):
+            games = d["openGames"]
+        elif isinstance(data.get("openGames"), list):
+            games = data["openGames"]
+    events: list[Event] = []
+    for g in games:
+        if not isinstance(g, dict):
+            continue
+        # Football only (drops futsal/handball/other modalities).
+        if str(g.get("modality", "")).strip().lower() not in ("futebol", "football"):
+            continue
+        home = _norm_ws(str((g.get("homeTeam") or {}).get("name", "")))
+        away = _norm_ws(str((g.get("awayTeam") or {}).get("name", "")))
+        title = " x ".join(t for t in (home, away) if t) or "Sporting CP"
+        if g.get("soldOut"):
+            status = "SOLD_OUT"
+        elif g.get("allowSale"):
+            status = "AVAILABLE"
+        else:
+            status = "SOON"
+        comp = _norm_ws(str(g.get("competition", "")))
+        if g.get("member") and not g.get("public"):
+            comp = f"{comp} · только для sócios" if comp else "только для sócios"
+        when = _fmt_iso_datetime(str(g.get("date", "")))
+        eid = str(g.get("id") or _event_id("", f"{title}-{g.get('date','')}"))
+        context = _norm_ws(f"{title} {comp} {g.get('modality','')}")
+        events.append(Event(eid, title, src.browse_url or src.url, when or None,
+                            status, context, extra=comp))
+    return events
+
+
 def parse_sporting_dom(html: str, src: "Source") -> list[Event]:
     """Parse tickets.sporting.pt rendered DOM (Angular 'game' cards)."""
     soup = BeautifulSoup(html, "html.parser")
@@ -650,7 +695,10 @@ def load_events(src: "Source") -> list[Event]:
     """Fetch and parse events for a source (JSON API, browser render, or HTML)."""
     if src.api_type == "json" and src.api_url:
         raw = fetch(src.api_url, accept="application/json, text/plain, */*")
-        return parse_json_events(json.loads(raw), src)
+        data = json.loads(raw)
+        if src.parser == "sporting_api":
+            return parse_sporting_api(data, src)
+        return parse_json_events(data, src)
     if src.api_type == "browser":
         html = render_with_browser(src.browse_url, src.wait_selector, src.wait_ms)
         if src.parser == "sporting":
@@ -746,9 +794,12 @@ def run_diagnostic(cfg: Config, dump_file: str | None) -> int:
             except Exception as err:  # noqa: BLE001
                 print(f"FETCH FAILED: {err}")
                 continue
-            print(f"Fetched {len(raw)} bytes of JSON; head: {raw[:300]}")
+            print(f"Fetched {len(raw)} bytes of JSON; head: {raw[:200]}")
             try:
-                events = parse_json_events(json.loads(raw), src)
+                data = json.loads(raw)
+                events = (parse_sporting_api(data, src)
+                          if src.parser == "sporting_api"
+                          else parse_json_events(data, src))
             except Exception as err:  # noqa: BLE001
                 print(f"JSON parse failed: {err}")
                 continue

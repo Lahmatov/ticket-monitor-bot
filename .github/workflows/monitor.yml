@@ -53,16 +53,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Cache the headless Chromium used for browser-rendered sources (Sporting).
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-
-      - name: Install Chromium
-        run: python -m playwright install --with-deps chromium
-
       # Persist notification state between runs without committing to the repo.
       - name: Restore state
         id: restore
