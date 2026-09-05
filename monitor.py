@@ -548,8 +548,14 @@ def parse_json_events(data, src: "Source") -> list[Event]:
     return events
 
 
-def render_with_browser(url: str, wait_selector: str = "", wait_ms: int = 0) -> str:
-    """Render a JS page with headless Chromium and return the final HTML."""
+def render_with_browser(url: str, wait_selector: str = "", wait_ms: int = 0,
+                        capture: bool = False):
+    """Render a JS page with headless Chromium and return the final HTML.
+
+    If capture=True, also return a list of (url, status, content_type, body)
+    for API-looking XHR/fetch responses seen during the load (for diagnostics),
+    as a tuple (html, captures).
+    """
     from playwright.sync_api import sync_playwright  # lazy: only browser sources
 
     launch: dict = {"headless": True, "args": ["--no-sandbox",
@@ -557,10 +563,34 @@ def render_with_browser(url: str, wait_selector: str = "", wait_ms: int = 0) -> 
     exe = os.environ.get("PW_CHROMIUM", "").strip()
     if exe:
         launch["executable_path"] = exe
+    captures: list = []
+
+    def _on_response(resp):
+        try:
+            ct = resp.headers.get("content-type", "")
+            u = resp.url
+            interesting = "json" in ct or any(
+                k in u.lower() for k in ("api", "game", "event", "bilhet",
+                                         "ticket", "sess", "sport", "graphql"))
+            if not interesting or u.endswith((".js", ".css", ".png", ".jpg",
+                                              ".svg", ".woff", ".woff2")):
+                return
+            body = ""
+            if "json" in ct:
+                try:
+                    body = resp.text()[:600]
+                except Exception:  # noqa: BLE001
+                    body = "(body unavailable)"
+            captures.append((u, resp.status, ct, body))
+        except Exception:  # noqa: BLE001 - never let capture break render
+            pass
+
     with sync_playwright() as p:
         browser = p.chromium.launch(**launch)
         try:
             page = browser.new_page(user_agent=USER_AGENT, locale="pt-PT")
+            if capture:
+                page.on("response", _on_response)
             page.goto(url, wait_until="networkidle", timeout=45000)
             if wait_selector:
                 try:
@@ -569,7 +599,8 @@ def render_with_browser(url: str, wait_selector: str = "", wait_ms: int = 0) -> 
                     pass
             if wait_ms:
                 page.wait_for_timeout(wait_ms)
-            return page.content()
+            html = page.content()
+            return (html, captures) if capture else html
         finally:
             browser.close()
 
@@ -724,12 +755,18 @@ def run_diagnostic(cfg: Config, dump_file: str | None) -> int:
             print(f"\nParsed {len(events)} event(s):\n")
         elif src.api_type == "browser":
             try:
-                page = render_with_browser(src.browse_url, src.wait_selector,
-                                           src.wait_ms)
+                page, caps = render_with_browser(src.browse_url, src.wait_selector,
+                                                 src.wait_ms, capture=True)
             except Exception as err:  # noqa: BLE001
                 print(f"RENDER FAILED: {err}")
                 continue
             print(f"Rendered {len(page)} bytes")
+            print(f"\n--- {len(caps)} API-looking network responses ---")
+            for (u, status, ct, body) in caps[:25]:
+                print(f"[{status}] {ct[:40]} {u}")
+                if body:
+                    print("    body:", _norm_ws(body)[:300])
+            print("--- end network ---")
             if dump_file:
                 out = f"{src.id}-{dump_file}"
                 with open(out, "w", encoding="utf-8") as fh:
