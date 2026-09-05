@@ -873,7 +873,7 @@ def _probe_get(url: str) -> None:
         return
     ctype = r.headers.get("content-type", "?")
     print(f"  status={r.status_code}  type={ctype}  len={len(r.text)}")
-    print("  body (first 700 chars):", _norm_ws(r.text)[:700] or "(empty)")
+    print("  body (first 2500 chars):", _norm_ws(r.text)[:2500] or "(empty)")
 
 
 def _probe_grep(url: str, terms: str) -> None:
