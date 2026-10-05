@@ -210,7 +210,7 @@ class Source:
     def __init__(self, id, name, url, keywords=None, exclude_keywords=None,
                  event_selector="", title_selector="", link_selector="",
                  api_url="", api_type="html", browse_url="",
-                 wait_selector="", wait_ms=0, parser=""):
+                 wait_selector="", wait_ms=0, parser="", emoji=""):
         self.id = str(id).strip()
         self.name = str(name).strip() or self.id
         self.url = str(url).strip()
@@ -229,6 +229,7 @@ class Source:
         self.wait_ms = int(wait_ms or 0)
         # Optional site-specific DOM parser (e.g. "sporting").
         self.parser = (parser or "").strip().lower()
+        self.emoji = (emoji or "").strip()  # shown before the team's heading
 
 
 def _sources_from_env() -> list[Source] | None:
@@ -1344,25 +1345,67 @@ _STATUS_LABEL = {
 }
 
 
-def _summary_lines(src: "Source", matched: list) -> list[str]:
-    """Human-readable report lines for one source (for the per-run heartbeat)."""
-    lines = [f"<b>{_esc(src.name)}</b>: {len(matched)} match(es)"]
+# Order and wording of the per-check legend / totals line.
+_STATUS_ORDER = ("AVAILABLE", "RESALE", "SOON", "SOLD_OUT", "UNKNOWN")
+_STATUS_DOT = {s: _STATUS_LABEL[s].split(" ", 1)[0] for s in _STATUS_ORDER}
+_STATUS_SHORT = {"AVAILABLE": "on sale", "RESALE": "resale only", "SOON": "soon",
+                 "SOLD_OUT": "sold out", "UNKNOWN": "unclear"}
+
+
+def _source_heading(src: "Source") -> str:
+    return f"{src.emoji + ' ' if src.emoji else ''}<b>{_esc(src.name.upper())}</b>"
+
+
+def _summary_block(src: "Source", matched: list) -> str:
+    """One team's section of the per-check report (heading + a line per match)."""
+    lines = [_source_heading(src)]
     if not matched:
-        lines.append("• no upcoming matches")
-        return lines
+        lines.append("<i>no upcoming matches</i>")
+        return "\n".join(lines)
     for ev in matched:
-        parts = [f"{_STATUS_LABEL.get(ev.status, ev.status)}: {ev.title}"]
+        dot = _STATUS_DOT.get(ev.status, "⚪️")
+        when = f"<b>{_esc(ev.date)}</b>  " if ev.date else ""
+        lines.append(f"{dot} {when}{_esc(ev.title)}")
         if ev.extra:
-            parts.append(ev.extra)
-        if ev.date:
-            parts.append(ev.date)
-        lines.append("• " + _esc(" · ".join(parts)))
-    return lines
+            lines.append(f"      <i>{_esc(ev.extra)}</i>")
+    return "\n".join(lines)
+
+
+def _totals_line(statuses: list[str]) -> str:
+    """'🟢 4 on sale · 🟡 7 soon · 🔴 3 sold out' (doubles as the legend)."""
+    parts = [f"{_STATUS_DOT[s]} {statuses.count(s)} {_STATUS_SHORT[s]}"
+             for s in _STATUS_ORDER if s in statuses]
+    return " · ".join(parts) or "no upcoming matches"
+
+
+TELEGRAM_MAX_CHARS = 3900  # Telegram's limit is 4096; keep a margin
+
+
+def _pack_messages(header: str, blocks: list[str]) -> list[str]:
+    """Join blocks (blank line between) into as few messages as fit the limit.
+
+    A team's block is never split across messages unless it alone is too long.
+    """
+    messages, cur = [], header
+    for block in blocks:
+        while len(block) > TELEGRAM_MAX_CHARS:  # pathological: one huge block
+            cut = block.rfind("\n", 0, TELEGRAM_MAX_CHARS)
+            cut = cut if cut > 0 else TELEGRAM_MAX_CHARS
+            messages.append(cur)
+            cur, block = block[:cut], block[cut:].lstrip("\n")
+        if len(cur) + 2 + len(block) > TELEGRAM_MAX_CHARS:
+            messages.append(cur)
+            cur = block
+        else:
+            cur = f"{cur}\n\n{block}" if cur else block
+    if cur:
+        messages.append(cur)
+    return messages
 
 
 def _process_source(cfg: Config, src: "Source", state: dict,
-                    now_iso: str) -> tuple[bool, list[str]]:
-    """Check one source; return (state_changed, report_lines)."""
+                    now_iso: str) -> tuple[bool, str, list[str]]:
+    """Check one source; return (state_changed, report_block, statuses)."""
     notified = state["notified"]
     failures = state["failures"]
     dirty = False
@@ -1372,8 +1415,8 @@ def _process_source(cfg: Config, src: "Source", state: dict,
         log.error("[%s] fetch/parse failed: %s", src.id, err)
         failures[src.id] = failures.get(src.id, 0) + 1
         _maybe_alert_failure(cfg, src, failures[src.id], err)
-        return True, [f"<b>{_esc(src.name)}</b>: ⚠️ could not read the site "
-                      f"({_esc(str(err)[:80])})"]
+        return True, (f"{_source_heading(src)}\n⚠️ could not read the site "
+                      f"<i>({_esc(str(err)[:80])})</i>"), []
 
     if failures.get(src.id):
         failures[src.id] = 0
@@ -1408,7 +1451,7 @@ def _process_source(cfg: Config, src: "Source", state: dict,
             # a new sale phase) trigger a fresh alert.
             del notified[key]
             dirty = True
-    return dirty, _summary_lines(src, matched)
+    return dirty, _summary_block(src, matched), [e.status for e in matched]
 
 
 def run_normal(cfg: Config) -> int:
@@ -1422,15 +1465,19 @@ def run_normal(cfg: Config) -> int:
     dirty = True
 
     now_iso = _now_utc().isoformat()
-    report: list[str] = []
+    blocks: list[str] = []
+    statuses: list[str] = []
     for src in cfg.sources:
-        changed, lines = _process_source(cfg, src, state, now_iso)
+        changed, block, sts = _process_source(cfg, src, state, now_iso)
         dirty = dirty or changed
-        report.extend(lines)
+        blocks.append(block)
+        statuses.extend(sts)
 
     if cfg.report_every_run:
-        header = f"🔎 <b>Ticket check</b> · {now_lisbon.strftime('%H:%M %d.%m')}"
-        telegram_send(cfg, header + "\n\n" + "\n".join(report))
+        header = (f"🔎 <b>Ticket check</b> · {now_lisbon.strftime('%H:%M %d.%m')}\n"
+                  f"{_totals_line(statuses)}")
+        for msg in _pack_messages(header, blocks):
+            telegram_send(cfg, msg)
 
     if _prune_state(state, now_iso):
         dirty = True

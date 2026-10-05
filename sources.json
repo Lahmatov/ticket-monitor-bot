@@ -1,7 +1,8 @@
 [
   {
     "id": "fpf",
-    "name": "Portugal national team (FPF)",
+    "name": "Portugal (FPF)",
+    "emoji": "🇵🇹",
     "url": "https://bilheteira.fpf.pt/",
     "api_type": "json",
     "api_url": "https://bilheteira.fpf.pt/public/Event",
@@ -12,7 +13,8 @@
   },
   {
     "id": "sporting",
-    "name": "Sporting CP (football)",
+    "name": "Sporting CP",
+    "emoji": "🦁",
     "url": "https://tickets.sporting.pt/pt",
     "api_type": "json",
     "api_url": "https://tickets.sporting.pt/api/match/allopengames",
@@ -71,7 +73,8 @@
   },
   {
     "id": "benfica",
-    "name": "SL Benfica (football)",
+    "name": "SL Benfica",
+    "emoji": "🦅",
     "url": "https://www.slbenfica.pt/pt-pt/bilhetes",
     "api_type": "html",
     "parser": "benfica",
@@ -89,7 +92,8 @@
   },
   {
     "id": "fcporto",
-    "name": "FC Porto (football)",
+    "name": "FC Porto",
+    "emoji": "🐉",
     "url": "https://bilhetes.fcporto.pt/",
     "api_type": "json",
     "api_url": "https://bilhetes-api.fcporto.pt/api/graphql",

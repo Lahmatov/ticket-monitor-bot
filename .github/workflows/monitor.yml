@@ -82,9 +82,13 @@ jobs:
             python monitor.py --mode "${{ inputs.mode }}"
           fi
 
-      # Save updated state only when it actually changed (keeps cache churn low).
+      # Save updated state when it changed. Loop runs always save (even when
+      # cancelled for a restart): monitor.py writes state.json after every
+      # check, so a restart neither repeats alerts nor loses dedup memory.
       - name: Save state
-        if: (success() || failure()) && steps.run.outputs.state_changed == 'true'
+        if: >-
+          always() && hashFiles('state.json') != '' &&
+          (env.IS_LOOP == 'true' || steps.run.outputs.state_changed == 'true')
         uses: actions/cache/save@v4
         with:
           path: state.json
