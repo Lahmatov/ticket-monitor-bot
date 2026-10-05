@@ -1,0 +1,30 @@
+name: Explore Sporting (one-off)
+
+# Manual helper: opens tickets.sporting.pt in Chromium and logs the API calls
+# the site makes for a match, to find where per-sector availability lives.
+
+on:
+  workflow_dispatch:
+    inputs:
+      match_text:
+        description: "Text identifying the match card (e.g. LASK)"
+        type: string
+        default: "LASK"
+
+permissions:
+  contents: read
+
+jobs:
+  explore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install playwright==1.47.0 && python -m playwright install --with-deps chromium
+      - name: Explore
+        env:
+          MATCH_TEXT: ${{ inputs.match_text }}
+        run: python tools/explore_sporting.py
