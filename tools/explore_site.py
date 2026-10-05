@@ -72,6 +72,38 @@ def explore(browser, url):
     for _ in range(4):
         page.mouse.wheel(0, 1500)
         page.wait_for_timeout(1000)
+    # Optional click path: CLICKS="21;;LASK;;Comprar" (exact text first, then
+    # substring). Logs the URL after each click and any popup that opens.
+    popups = []
+    page.context.on("page", lambda pg: popups.append(pg))
+    for label in [c for c in os.environ.get("CLICKS", "").split(";;") if c.strip()]:
+        label = label.strip()
+        target = None
+        for loc in (page.get_by_text(label, exact=True), page.get_by_text(label)):
+            try:
+                if loc.count():
+                    target = loc.first
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+        if target is None:
+            print(f"### CLICK '{label}': not found")
+            continue
+        try:
+            target.scroll_into_view_if_needed(timeout=5000)
+            target.click(timeout=8000)
+        except Exception as err:  # noqa: BLE001
+            print(f"### CLICK '{label}': failed: {str(err)[:200]}")
+            continue
+        page.wait_for_timeout(5000)
+        print(f"### CLICK '{label}' -> URL {page.url}")
+        for pg in popups:
+            try:
+                pg.wait_for_load_state(timeout=15000)
+            except Exception:  # noqa: BLE001
+                pass
+            print(f"    popup -> {pg.url}")
+        popups.clear()
     print("\n### FINAL URL:", page.url)
     try:
         text = re.sub(r"\s+", " ", page.inner_text("body"))

@@ -18,6 +18,10 @@ on:
         description: "Regex: only log data responses whose URL/POST body matches"
         type: string
         default: ""
+      clicks:
+        description: "Click path, ';;'-separated texts (e.g. 21;;LASK)"
+        type: string
+        default: ""
       body_chars:
         description: "Max chars of each response body to print"
         type: string
@@ -42,5 +46,6 @@ jobs:
           LINK_RE: ${{ inputs.link_re }}
           ONLY_RE: ${{ inputs.only_re }}
           BODY_CHARS: ${{ inputs.body_chars }}
+          CLICKS: ${{ inputs.clicks }}
           CARD_DUMP: "0"
         run: python tools/explore_site.py
