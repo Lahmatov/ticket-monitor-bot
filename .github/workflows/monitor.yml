@@ -26,9 +26,10 @@ on:
         type: string
         default: ""
 
-# One monitor at a time; a run triggered while one is active waits its turn.
+# One monitor loop at a time; a loop run triggered while one is active waits
+# its turn. One-off modes (diagnostic/test/probe/chatid) run immediately.
 concurrency:
-  group: ticket-monitor
+  group: ticket-monitor-${{ (github.event_name == 'schedule' || inputs.mode == 'normal') && 'loop' || github.run_id }}
   cancel-in-progress: false
 
 permissions:
