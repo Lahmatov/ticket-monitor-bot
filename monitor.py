@@ -979,26 +979,45 @@ def _probe_get(url: str) -> None:
     print("  body (first 2500 chars):", _norm_ws(r.text)[:2500] or "(empty)")
 
 
-def _probe_grep(url: str, terms: str) -> None:
+_CHUNK_RE = re.compile(r'["\'(](?:\./|/)?((?:chunk|[a-z0-9\-]+)-[A-Z0-9]{8}\.js)["\')]')
+
+
+def _probe_grep(url: str, terms: str, _seen: set | None = None) -> None:
     """Download url and print context around each occurrence of each term.
 
-    terms is comma-separated; matching is case-insensitive.
+    terms is comma-separated; matching is case-insensitive. For a .js bundle,
+    lazily-loaded chunks it references (esbuild "chunk-XXXXXXXX.js") are
+    scanned too; files with no hits are summarised in one line.
     """
+    seen = _seen if _seen is not None else set()
+    if url in seen or len(seen) >= 150:
+        return
+    seen.add(url)
     try:
         body = fetch(url)
     except Exception as err:  # noqa: BLE001
         print(f"\n=== GREP in {url}: fetch failed: {err} ===")
         return
-    print(f"\n=== GREP in {url} ({len(body)} bytes) ===")
+    found = []
     for term in terms.split(","):
         term = term.strip()
         if not term:
             continue
         idxs = [m.start() for m in re.finditer(re.escape(term), body, re.IGNORECASE)]
-        print(f"  [{term}] {len(idxs)} hit(s)")
-        for i in idxs[:6]:
-            snippet = body[max(0, i - 90):i + 90].replace("\n", " ")
-            print("     …", snippet, "…")
+        if idxs:
+            found.append((term, idxs))
+    if found:
+        print(f"\n=== GREP in {url} ({len(body)} bytes) ===")
+        for term, idxs in found:
+            print(f"  [{term}] {len(idxs)} hit(s)")
+            for i in idxs[:6]:
+                snippet = body[max(0, i - 150):i + 150].replace("\n", " ")
+                print("     …", snippet, "…")
+    else:
+        print(f"  (no hits in {url}, {len(body)} bytes)")
+    if url.endswith(".js"):
+        for name in sorted(set(_CHUNK_RE.findall(body))):
+            _probe_grep(urljoin(url, name), terms, seen)
 
 
 def run_probe(cfg: Config) -> int:
