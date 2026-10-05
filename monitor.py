@@ -327,16 +327,23 @@ def should_act(now_lisbon: datetime, state: dict) -> tuple[bool, bool]:
 # --------------------------------------------------------------------------- #
 
 
-def fetch(url: str, accept: str = "text/html,application/xhtml+xml") -> str:
+def fetch(url: str, accept: str = "text/html,application/xhtml+xml",
+          json_body: dict | None = None, extra_headers: dict | None = None) -> str:
+    """GET url (or POST json_body) with retries; return the response text."""
     headers = {
         "User-Agent": USER_AGENT,
         "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
         "Accept": accept,
+        **(extra_headers or {}),
     }
     last_err: Exception | None = None
     for attempt in range(1, REQUEST_RETRIES + 1):
         try:
-            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            if json_body is not None:
+                resp = requests.post(url, json=json_body, headers=headers,
+                                     timeout=REQUEST_TIMEOUT)
+            else:
+                resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             return resp.text
         except requests.RequestException as err:  # noqa: PERF203
@@ -688,15 +695,203 @@ def parse_sporting_api(data, src: "Source") -> list[Event]:
             status = "AVAILABLE"
         comp = _norm_ws(str(g.get("competition", "")))
         if g.get("member") and not g.get("public"):
-            comp = f"{comp} · только для sócios" if comp else "только для sócios"
+            comp = f"{comp} · members (sócios) only" if comp else "members (sócios) only"
         if status == "SOON" and reason:
-            comp = f"{comp} · «{reason}»" if comp else f"«{reason}»"
+            label = "coming soon" if "brevemente" in reason.lower() else reason
+            comp = f"{comp} · site: {label}" if comp else f"site: {label}"
         when = _fmt_iso_datetime(str(g.get("date", "")))
         eid = str(g.get("id") or _event_id("", f"{title}-{g.get('date','')}"))
         context = _norm_ws(f"{title} {comp} {g.get('modality','')}")
         events.append(Event(eid, title, src.browse_url or src.url, when or None,
                             status, context, extra=comp,
                             start=_parse_start(g.get("date"))))
+    return events
+
+
+FCPORTO_QUERY = """
+query getHomeMatches($pageSize: Int!, $matchDate: DateFilter!, $sport: SportId) {
+  matchesByDate(filters: {limitMatchDates: $pageSize, sport: $sport, matchDate: $matchDate}) {
+    date
+    matches {
+      id
+      sport
+      competition { name sport }
+      competitionPhase
+      homeTeam { shortName fullName }
+      awayTeam { shortName fullName }
+      localStartsAt
+      localSaleStartsAt
+      status
+    }
+  }
+}
+"""
+
+# bilhetes.fcporto.pt match.status -> our status (unknown values -> UNKNOWN,
+# shown raw in the report so they can be mapped here).
+_FCPORTO_STATUS = {
+    "SOLD_OUT": "SOLD_OUT",
+    "ON_SALE": "AVAILABLE", "AVAILABLE": "AVAILABLE", "OPEN": "AVAILABLE",
+    "SELLING": "AVAILABLE", "ACTIVE": "AVAILABLE", "PUBLISHED": "AVAILABLE",
+    "SOON": "SOON", "COMING_SOON": "SOON", "NOT_STARTED": "SOON",
+    "SCHEDULED": "SOON", "UPCOMING": "SOON", "PRE_SALE": "SOON",
+    "CLOSED": "SOLD_OUT", "SALE_CLOSED": "SOLD_OUT", "ENDED": "SOLD_OUT",
+}
+
+
+def fetch_fcporto(src: "Source") -> str:
+    """POST the GraphQL query the bilhetes.fcporto.pt home page uses."""
+    today = datetime.now(LISBON).strftime("%Y-%m-%d")
+    body = {"query": FCPORTO_QUERY,
+            "variables": {"pageSize": 12, "matchDate": {"from": today},
+                          "sport": "FOOTBALL"}}
+    return fetch(src.api_url, accept="application/json", json_body=body,
+                 extra_headers={"Origin": "https://bilhetes.fcporto.pt",
+                                "Referer": "https://bilhetes.fcporto.pt/"})
+
+
+def parse_fcporto(data, src: "Source") -> list[Event]:
+    """Parse the matchesByDate GraphQL response; FC Porto first team only."""
+    if not isinstance(data, dict):
+        return []
+    if data.get("errors"):
+        raise RuntimeError(f"GraphQL error: {str(data['errors'])[:200]}")
+    days = (data.get("data") or {}).get("matchesByDate") or []
+    events: list[Event] = []
+    now = _now_utc()
+    for day in days:
+        for g in (day or {}).get("matches") or []:
+            if not isinstance(g, dict):
+                continue
+            if str(g.get("sport") or "").upper() not in ("FOOTBALL", ""):
+                continue
+            home = _norm_ws(str((g.get("homeTeam") or {}).get("shortName") or ""))
+            away = _norm_ws(str((g.get("awayTeam") or {}).get("shortName") or ""))
+            # First team only: one side must be exactly "FC Porto" (the B and
+            # women's teams carry a suffix).
+            if "fc porto" not in (home.lower(), away.lower()):
+                continue
+            title = " x ".join(t for t in (home, away) if t)
+            raw = str(g.get("status") or "").upper()
+            status = _FCPORTO_STATUS.get(raw, "UNKNOWN")
+            sale_start = _parse_start(g.get("localSaleStartsAt"))
+            if status == "AVAILABLE" and sale_start and sale_start > now:
+                status = "SOON"
+            comp = _norm_ws(" · ".join(
+                x for x in (str((g.get("competition") or {}).get("name") or ""),
+                            str(g.get("competitionPhase") or "")) if x))
+            notes = [comp] if comp else []
+            if status == "SOON" and sale_start and sale_start > now:
+                notes.append("sale opens " + sale_start.astimezone(LISBON).strftime("%d.%m %H:%M"))
+            if status == "UNKNOWN":
+                notes.append(f"site status: {raw or '?'}")
+            start = _parse_start(g.get("localStartsAt"))
+            eid = str(g.get("id") or _event_id("", f"{title}-{g.get('localStartsAt')}"))
+            events.append(Event(eid, title, f"https://bilhetes.fcporto.pt/jogos/{eid}",
+                                start.astimezone(LISBON).strftime("%d.%m %H:%M") if start else None,
+                                status, _norm_ws(f"{title} {comp} {raw}"),
+                                extra=" · ".join(notes), start=start))
+    return events
+
+
+_PT_MONTHS = {"jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
+              "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12}
+_PT_DATE_RE = re.compile(
+    r"(\d{1,2})\s*(?:de\s+)?([a-zç]{3})[a-zç]*\.?,?\s*(?:de\s+\d{4}\s*)?"
+    r"(?:às|as|-|,)?\s*(\d{1,2})\s*[h:]\s*(\d{2})", re.IGNORECASE)
+
+
+def _parse_pt_datetime(text: str, now: datetime | None = None) -> datetime | None:
+    """'Dom 11 Out 18h00' / '20 de outubro às 20:00' -> aware Lisbon datetime.
+
+    The year is not shown on these sites: pick the one that puts the match
+    closest to now (a date >60 days in the past means next year).
+    """
+    m = _PT_DATE_RE.search(text or "")
+    if not m:
+        return None
+    month = _PT_MONTHS.get(m.group(2).lower()[:3])
+    if not month:
+        return None
+    now = (now or _now_utc()).astimezone(LISBON)
+    try:
+        dt = datetime(now.year, month, int(m.group(1)), int(m.group(3)),
+                      int(m.group(4)), tzinfo=LISBON)
+    except ValueError:
+        return None
+    if (now - dt).days > 60:
+        dt = dt.replace(year=dt.year + 1)
+    return dt
+
+
+# Benfica status badge (div.button-type-container) -> (status, note)
+_BENFICA_BADGES = (
+    ("esgotado", "SOLD_OUT", ""),
+    ("mercado secund", "RESALE", ""),
+    ("por iniciar", "SOON", ""),
+    ("exclusivo", "AVAILABLE", None),  # None -> use the badge text as the note
+)
+_BENFICA_BADGE_EN = {
+    "exclusivo a sócios e adeptos registados": "members & registered fans only",
+    "exclusivo a sócios com quotas em dia": "paid-up members only",
+    "exclusivo a sócios com red pass": "Red Pass members only",
+}
+
+
+def parse_benfica(html: str, src: "Source") -> list[Event]:
+    """Parse slbenfica.pt/pt-pt/bilhetes (server-rendered match cards).
+
+    Only the "Equipa A" tab is used (the page also lists women's, B team,
+    U23 and Youth League games).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    events: list[Event] = []
+    for card in soup.select("section.game-module"):
+        tab = card.find_parent(class_="tab-nav")
+        if tab is not None and "equipaA" not in (tab.get("class") or []):
+            continue  # another team's tab
+        kind = _norm_ws(card.select_one(".type-game").get_text(" ")) \
+            if card.select_one(".type-game") else ""
+        if kind and kind.lower() != "futebol":
+            continue
+        link = None
+        for a in card.select(".buttons-tickets a[href]"):
+            href = a["href"]
+            if "/loja/bilhetes/jogos/" in href and not href.endswith("#"):
+                link = a
+                break
+        if tab is None and (link is None or not re.search(r"/jogos/compra(v2)?/", link["href"])):
+            continue  # no tab info: keep only first-team ticket links
+        teams = [_norm_ws(h.get_text(" ")) for h in card.select(".team h3.hidden-xs")]
+        title = " x ".join(t for t in teams if t) or "SL Benfica"
+        comp = _norm_ws(card.select_one(".type-liga").get_text(" ")) \
+            if card.select_one(".type-liga") else ""
+        when_el = card.select_one(".game_bar h5")
+        when_txt = _norm_ws(when_el.get_text(" ")) if when_el else ""
+        start = _parse_pt_datetime(when_txt)
+
+        badge = ""
+        box = card.select_one(".button-type-container")
+        if box is not None:  # commented-out <p>s are Comments, not tags
+            badge = " ".join(_norm_ws(p.get_text(" ")) for p in box.find_all("p"))
+        status, note = "", ""
+        for needle, st, nt in _BENFICA_BADGES:
+            if needle in badge.lower():
+                status = st
+                note = _BENFICA_BADGE_EN.get(badge.lower(), badge) if nt is None else nt
+                break
+        if not status:
+            buttons = card.select_one(".buttons-tickets")
+            hidden = buttons is not None and "none" in (buttons.get("style") or "")
+            status = "AVAILABLE" if link is not None and not hidden else "SOON"
+        extra = " · ".join(x for x in (comp, note) if x)
+        url = link["href"] if link is not None else src.url
+        eid = url.rstrip("/").rsplit("/", 1)[-1] if link is not None \
+            else _event_id("", f"{title}-{when_txt}")
+        events.append(Event(eid, title, url,
+                            start.strftime("%d.%m %H:%M") if start else (when_txt or None),
+                            status, _norm_ws(f"{title} {comp} {badge}"), extra=extra,
+                            start=start))
     return events
 
 
@@ -749,17 +944,33 @@ def load_events(src: "Source") -> list[Event]:
 def _load_events_raw(src: "Source") -> list[Event]:
     """Fetch and parse events for a source (JSON API, browser render, or HTML)."""
     if src.api_type == "json" and src.api_url:
-        raw = fetch(src.api_url, accept="application/json, text/plain, */*")
-        data = json.loads(raw)
-        if src.parser == "sporting_api":
-            return parse_sporting_api(data, src)
-        return parse_json_events(data, src)
+        return parse_source_json(json.loads(fetch_source_json(src)), src)
     if src.api_type == "browser":
         html = render_with_browser(src.browse_url, src.wait_selector, src.wait_ms)
         if src.parser == "sporting":
             return parse_sporting_dom(html, src)
         return parse_events(html, src.browse_url, src)
     page = fetch(src.url)
+    return parse_html_source(page, src)
+
+
+def fetch_source_json(src: "Source") -> str:
+    if src.parser == "fcporto":
+        return fetch_fcporto(src)
+    return fetch(src.api_url, accept="application/json, text/plain, */*")
+
+
+def parse_source_json(data, src: "Source") -> list[Event]:
+    if src.parser == "sporting_api":
+        return parse_sporting_api(data, src)
+    if src.parser == "fcporto":
+        return parse_fcporto(data, src)
+    return parse_json_events(data, src)
+
+
+def parse_html_source(page: str, src: "Source") -> list[Event]:
+    if src.parser == "benfica":
+        return parse_benfica(page, src)
     return parse_events(page, src.url, src)
 
 
@@ -806,7 +1017,7 @@ def _esc(text: str) -> str:
 
 
 def format_notification(event: Event, source_name: str) -> str:
-    lines = [f"\U0001F3AB <b>Bilhetes à venda!</b> — {_esc(source_name)}",
+    lines = [f"\U0001F3AB <b>Tickets on sale!</b> — {_esc(source_name)}",
              "", f"<b>{_esc(event.title)}</b>"]
     if event.extra:
         lines.append(f"\U0001F3C6 {_esc(event.extra)}")
@@ -814,7 +1025,7 @@ def format_notification(event: Event, source_name: str) -> str:
         lines.append(f"\U0001F4C5 {_esc(event.date)}")
     if event.url:
         lines.append("")
-        lines.append(f'\U0001F517 <a href="{_esc(event.url)}">Comprar agora</a>')
+        lines.append(f'\U0001F517 <a href="{_esc(event.url)}">Buy now</a>')
     return "\n".join(lines)
 
 
@@ -845,16 +1056,13 @@ def run_diagnostic(cfg: Config, dump_file: str | None) -> int:
         print(f"\n{'=' * 70}\nSOURCE: {src.name} [{src.id}] ({src.api_type}) -> {target}\n{'=' * 70}")
         if src.api_type == "json" and src.api_url:
             try:
-                raw = fetch(src.api_url, accept="application/json, text/plain, */*")
+                raw = fetch_source_json(src)
             except Exception as err:  # noqa: BLE001
                 print(f"FETCH FAILED: {err}")
                 continue
             print(f"Fetched {len(raw)} bytes of JSON; head: {raw[:200]}")
             try:
-                data = json.loads(raw)
-                events = (parse_sporting_api(data, src)
-                          if src.parser == "sporting_api"
-                          else parse_json_events(data, src))
+                events = parse_source_json(json.loads(raw), src)
             except Exception as err:  # noqa: BLE001
                 print(f"JSON parse failed: {err}")
                 continue
@@ -900,16 +1108,16 @@ def run_diagnostic(cfg: Config, dump_file: str | None) -> int:
                 with open(out, "w", encoding="utf-8") as fh:
                     fh.write(page)
                 print(f"Raw HTML written to {out}")
-            if not parse_events(page, src.url, src):
+            events = parse_html_source(page, src)
+            if not events:
                 _diag_hints(page)
-            events = parse_events(page, src.url, src)
             print(f"\nParsed {len(events)} candidate event link(s):\n")
         upcoming = drop_past(events)
         for ev in events:
             star = "  <-- keyword match" if matches_keywords(ev, src) else ""
             if ev not in upcoming:
                 star = "  (already played -> hidden)"
-            print(f"[{ev.status:9}] {ev.title[:70]!r} | {ev.date} | {ev.url}{star}")
+            print(f"[{ev.status:9}] {ev.title[:70]!r} | {ev.date} | {ev.extra} | {ev.url}{star}")
         matched = [e for e in upcoming if matches_keywords(e, src)]
         kw = src.keywords or "(all events)"
         print(f"\nKeywords {kw}: {len(matched)} match; "
@@ -1126,18 +1334,19 @@ def run_test(cfg: Config) -> int:
 
 
 _STATUS_LABEL = {
-    "AVAILABLE": "🟢 в продаже",
-    "SOLD_OUT": "🔴 распродано",
-    "SOON": "🟡 скоро",
-    "UNKNOWN": "⚪️ статус неясен",
+    "AVAILABLE": "🟢 on sale",
+    "SOLD_OUT": "🔴 sold out",
+    "SOON": "🟡 not on sale yet",
+    "RESALE": "🟠 resale only (official secondary market)",
+    "UNKNOWN": "⚪️ status unclear",
 }
 
 
 def _summary_lines(src: "Source", matched: list) -> list[str]:
     """Human-readable report lines for one source (for the per-run heartbeat)."""
-    lines = [f"<b>{_esc(src.name)}</b>: {len(matched)} матч(ей)"]
+    lines = [f"<b>{_esc(src.name)}</b>: {len(matched)} match(es)"]
     if not matched:
-        lines.append("• подходящих матчей нет")
+        lines.append("• no upcoming matches")
         return lines
     for ev in matched:
         parts = [f"{_STATUS_LABEL.get(ev.status, ev.status)}: {ev.title}"]
@@ -1161,7 +1370,7 @@ def _process_source(cfg: Config, src: "Source", state: dict,
         log.error("[%s] fetch/parse failed: %s", src.id, err)
         failures[src.id] = failures.get(src.id, 0) + 1
         _maybe_alert_failure(cfg, src, failures[src.id], err)
-        return True, [f"<b>{_esc(src.name)}</b>: ⚠️ ошибка чтения "
+        return True, [f"<b>{_esc(src.name)}</b>: ⚠️ could not read the site "
                       f"({_esc(str(err)[:80])})"]
 
     if failures.get(src.id):
@@ -1218,7 +1427,7 @@ def run_normal(cfg: Config) -> int:
         report.extend(lines)
 
     if cfg.report_every_run:
-        header = f"🔎 <b>Проверка билетов</b> · {now_lisbon.strftime('%H:%M %d.%m')}"
+        header = f"🔎 <b>Ticket check</b> · {now_lisbon.strftime('%H:%M %d.%m')}"
         telegram_send(cfg, header + "\n\n" + "\n".join(report))
 
     if _prune_state(state, now_iso):
