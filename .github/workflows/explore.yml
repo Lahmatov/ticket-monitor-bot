@@ -1,15 +1,15 @@
-name: Explore Sporting (one-off)
+name: Explore ticket site (one-off)
 
-# Manual helper: opens tickets.sporting.pt in Chromium and logs the API calls
-# the site makes for a match, to find where per-sector availability lives.
+# Manual helper: opens ticket sites in Chromium and logs the data/API calls
+# they make, to find the JSON endpoint a new source can use.
 
 on:
   workflow_dispatch:
     inputs:
-      match_text:
-        description: "Text identifying the match card (e.g. LASK)"
+      urls:
+        description: "Comma-separated URLs to open"
         type: string
-        default: "LASK"
+        default: ""
 
 permissions:
   contents: read
@@ -26,5 +26,5 @@ jobs:
       - run: pip install playwright==1.47.0 && python -m playwright install --with-deps chromium
       - name: Explore
         env:
-          MATCH_TEXT: ${{ inputs.match_text }}
-        run: python tools/explore_sporting.py
+          EXPLORE_URLS: ${{ inputs.urls }}
+        run: python tools/explore_site.py
