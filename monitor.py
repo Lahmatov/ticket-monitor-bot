@@ -504,7 +504,14 @@ def _first_str(d: dict, keys) -> str:
     return ""
 
 
+_JSON_SOLD_OUT_KEYS = ("issoldout", "soldout", "esgotado", "isesgotado")
+
+
 def _json_status(item: dict) -> str:
+    # Explicit sold-out flag wins (FPF: "isSoldOut": true).
+    for k, v in item.items():
+        if k.lower() in _JSON_SOLD_OUT_KEYS and v is True:
+            return "SOLD_OUT"
     for k, v in item.items():
         if k.lower() not in _JSON_STATUS_KEYS:
             continue
