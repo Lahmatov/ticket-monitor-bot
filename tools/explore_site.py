@@ -11,6 +11,8 @@ import re
 
 from playwright.sync_api import sync_playwright
 
+BODY_CHARS = int(os.environ.get("BODY_CHARS", "700"))
+LINK_RE = re.compile(os.environ.get("LINK_RE", r"bilhete|ticket|/event"), re.I)
 URLS = [u.strip() for u in os.environ.get("EXPLORE_URLS", "").split(",") if u.strip()]
 NOISE = ("google", "facebook", "doubleclick", "hotjar", "clarity", "analytics",
          "cookiebot", "onetrust", "gtm", "tiktok", "linkedin", "sentry", "fonts.",
@@ -51,9 +53,8 @@ def explore(browser, url):
             body = resp.text()
         except Exception:  # noqa: BLE001
             body = "(no body)"
-        captured.append(u)
-        print(f"\n[{resp.status}] {resp.request.method} {u}  ({ctype[:30]}, {len(body)}b)"
-              f"\n    {short(body)}", flush=True)
+        captured.append(f"[{resp.status}] {resp.request.method} {u}  ({ctype[:30]}, "
+                        f"{len(body)}b)\n    {short(body, BODY_CHARS)}")
 
     page.on("response", on_response)
     try:
@@ -70,7 +71,7 @@ def explore(browser, url):
         text = re.sub(r"\s+", " ", page.inner_text("body"))
     except Exception as err:  # noqa: BLE001
         text = f"(text failed: {err})"
-    print("### PAGE TEXT:", text[:3000])
+    print("### PAGE TEXT:", text[:int(os.environ.get("TEXT_CHARS", "1500"))])
     print("### LINKS:")
     seen = set()
     for a in page.query_selector_all("a[href]"):
@@ -78,9 +79,11 @@ def explore(browser, url):
         if href in seen:
             continue
         seen.add(href)
-        if re.search(r"jogo|game|match|evento|event|bilhet|ticket|partida", href, re.I):
+        if LINK_RE.search(href):
             print("   ", href[:150], "|", re.sub(r"\s+", " ", a.inner_text())[:60])
-    print(f"### {len(captured)} data responses captured")
+    print(f"### {len(captured)} data responses:")
+    for c in captured:
+        print(c)
     page.close()
 
 

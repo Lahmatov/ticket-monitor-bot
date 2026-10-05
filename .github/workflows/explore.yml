@@ -10,6 +10,10 @@ on:
         description: "Comma-separated URLs to open"
         type: string
         default: ""
+      link_re:
+        description: "Regex: which links to print"
+        type: string
+        default: "bilhete|ticket|/event"
 
 permissions:
   contents: read
@@ -27,4 +31,5 @@ jobs:
       - name: Explore
         env:
           EXPLORE_URLS: ${{ inputs.urls }}
+          LINK_RE: ${{ inputs.link_re }}
         run: python tools/explore_site.py
