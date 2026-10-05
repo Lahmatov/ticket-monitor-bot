@@ -676,15 +676,21 @@ def parse_sporting_api(data, src: "Source") -> list[Event]:
         home = _norm_ws(str((g.get("homeTeam") or {}).get("name", "")))
         away = _norm_ws(str((g.get("awayTeam") or {}).get("name", "")))
         title = " x ".join(t for t in (home, away) if t) or "Sporting CP"
-        if g.get("soldOut"):
+        # "disabledReasonDesc" is the label on the site's disabled buy button
+        # ("Brevemente disponível", "Esgotado", …). allowSale stays true even
+        # then, so a reason means "not buyable right now".
+        reason = _norm_ws(str(g.get("disabledReasonDesc") or ""))
+        if g.get("soldOut") or _contains_any(reason, SOLD_OUT_WORDS):
             status = "SOLD_OUT"
-        elif g.get("allowSale"):
-            status = "AVAILABLE"
-        else:
+        elif reason or not g.get("allowSale"):
             status = "SOON"
+        else:
+            status = "AVAILABLE"
         comp = _norm_ws(str(g.get("competition", "")))
         if g.get("member") and not g.get("public"):
             comp = f"{comp} · только для sócios" if comp else "только для sócios"
+        if status == "SOON" and reason:
+            comp = f"{comp} · «{reason}»" if comp else f"«{reason}»"
         when = _fmt_iso_datetime(str(g.get("date", "")))
         eid = str(g.get("id") or _event_id("", f"{title}-{g.get('date','')}"))
         context = _norm_ws(f"{title} {comp} {g.get('modality','')}")
@@ -1187,7 +1193,9 @@ def _process_source(cfg: Config, src: "Source", state: dict,
                 entry["last_seen"] = now_iso
                 dirty = True
         elif entry is not None:
-            entry["last_seen"] = now_iso  # still listed, not buyable -> keep fresh
+            # Not buyable any more: forget it, so tickets coming back (returns,
+            # a new sale phase) trigger a fresh alert.
+            del notified[key]
             dirty = True
     return dirty, _summary_lines(src, matched)
 
