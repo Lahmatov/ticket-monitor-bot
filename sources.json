@@ -9,7 +9,8 @@
     "keywords": [
       "portugal"
     ],
-    "exclude_keywords": []
+    "exclude_keywords": [],
+    "event_url": "https://bilheteira.fpf.pt/checkOut/{id}"
   },
   {
     "id": "sporting",

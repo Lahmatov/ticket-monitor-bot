@@ -210,7 +210,7 @@ class Source:
     def __init__(self, id, name, url, keywords=None, exclude_keywords=None,
                  event_selector="", title_selector="", link_selector="",
                  api_url="", api_type="html", browse_url="",
-                 wait_selector="", wait_ms=0, parser="", emoji=""):
+                 wait_selector="", wait_ms=0, parser="", emoji="", event_url=""):
         self.id = str(id).strip()
         self.name = str(name).strip() or self.id
         self.url = str(url).strip()
@@ -230,6 +230,9 @@ class Source:
         # Optional site-specific DOM parser (e.g. "sporting").
         self.parser = (parser or "").strip().lower()
         self.emoji = (emoji or "").strip()  # shown before the team's heading
+        # Per-event buy link template for generic JSON sources, e.g.
+        # "https://bilheteira.fpf.pt/checkOut/{id}".
+        self.event_url = (event_url or "").strip()
 
 
 def _sources_from_env() -> list[Source] | None:
@@ -515,6 +518,15 @@ def _first_str(d: dict, keys) -> str:
 _JSON_SOLD_OUT_KEYS = ("issoldout", "soldout", "esgotado", "isesgotado")
 
 
+def _first_id(item: dict) -> str:
+    """First id-like value (string or integer), e.g. FPF's "eventID": 1630."""
+    for k, v in item.items():
+        if k.lower() in _JSON_ID_KEYS and isinstance(v, (str, int)) \
+                and not isinstance(v, bool) and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
 def _json_status(item: dict) -> str:
     # Explicit sold-out flag wins (FPF: "isSoldOut": true).
     for k, v in item.items():
@@ -564,7 +576,10 @@ def parse_json_events(data, src: "Source") -> list[Event]:
         date = _first_str(item, _JSON_DATE_KEYS)
         rel = _first_str(item, _JSON_URL_KEYS)
         url = urljoin(src.url, rel) if rel else src.url
-        eid = _first_str(item, _JSON_ID_KEYS) or _event_id(url, title)
+        raw_id = _first_id(item)
+        if src.event_url and raw_id and not rel:
+            url = src.event_url.format(id=raw_id)  # direct checkout link
+        eid = raw_id or _event_id(url, title)
         comp = _first_str(item, ("competition", "competicao", "competição",
                                  "stage", "phase", "venue", "local", "stadium",
                                  "estadio", "location"))
@@ -665,8 +680,13 @@ def drop_past(events: list[Event], now: datetime | None = None) -> list[Event]:
     return sorted(kept, key=lambda e: e.start or far)
 
 
-def parse_sporting_api(data, src: "Source") -> list[Event]:
-    """Parse tickets.sporting.pt /api/match/allopengames JSON (all open games)."""
+SPORTING_BUY_URL = "https://tickets.sporting.pt/pt/evento/{token}"
+SPORTING_GAME_API = ("https://tickets.sporting.pt/api/match/opengames"
+                     "?gamecode={token}&queueItToken=null")
+
+
+def _sporting_games(data) -> list[dict]:
+    """Upcoming football games from an allopengames response."""
     games = []
     if isinstance(data, dict):
         d = data.get("data")
@@ -674,38 +694,95 @@ def parse_sporting_api(data, src: "Source") -> list[Event]:
             games = d["openGames"]
         elif isinstance(data.get("openGames"), list):
             games = data["openGames"]
-    events: list[Event] = []
+    cutoff = _now_utc().timestamp() - PAST_GRACE_HOURS * 3600
+    out = []
     for g in games:
         if not isinstance(g, dict):
             continue
         # Football only (drops futsal/handball/other modalities).
         if str(g.get("modality", "")).strip().lower() not in ("futebol", "football"):
             continue
+        start = _parse_start(g.get("date"))
+        if start is not None and start.timestamp() < cutoff:
+            continue
+        out.append(g)
+    return out
+
+
+def fetch_sporting_details(data) -> dict:
+    """token -> the game's own page data (GET opengames?gamecode=...).
+
+    This is what the site loads when you open a match; unlike the listing it
+    reflects whether the purchase flow is really open (the listing kept
+    saying "Brevemente disponível" for a game that was on sale). Failures
+    are skipped; the parser then falls back to the listing.
+    """
+    details = {}
+    for g in _sporting_games(data):
+        token = str(g.get("token") or "").strip()
+        if not token:
+            continue
+        try:
+            body = json.loads(fetch(SPORTING_GAME_API.format(token=token),
+                                    accept="application/json, text/plain, */*"))
+            d = body.get("data") if isinstance(body, dict) else None
+            if isinstance(d, dict) and body.get("success", True):
+                details[token] = d
+        except Exception as err:  # noqa: BLE001 - one game must not sink the source
+            log.warning("[sporting] game %s detail failed: %s", token, err)
+    return details
+
+
+def _sporting_status(g: dict, detail: dict | None) -> tuple[str, str]:
+    """(status, note) for one game, preferring the game page's own data."""
+    if detail is not None:
+        reason = _norm_ws(str(detail.get("disabledReasonDesc") or ""))
+        if detail.get("soldOut") or _contains_any(reason, SOLD_OUT_WORDS):
+            return "SOLD_OUT", ""
+        if reason:
+            return "SOON", "site: " + ("coming soon" if "brevemente" in reason.lower()
+                                       else reason)
+        public = bool(detail.get("allowPublicTickets"))
+        member = bool(detail.get("allowMemberTickets"))
+        if detail.get("allowSale") and (public or member):
+            notes = []
+            if member and not public:
+                notes.append("members (sócios) only")
+            if detail.get("queueItRedirectUrl"):
+                notes.append("virtual queue active")
+            return "AVAILABLE", " · ".join(notes)
+        return "SOON", ""
+    # Fallback: listing only. Its disabledReasonDesc proved unreliable, so a
+    # listed reason makes the status "unclear" rather than "not on sale".
+    reason = _norm_ws(str(g.get("disabledReasonDesc") or ""))
+    if g.get("soldOut") or _contains_any(reason, SOLD_OUT_WORDS):
+        return "SOLD_OUT", ""
+    if reason:
+        return "UNKNOWN", f"listing says: {reason}"
+    return ("AVAILABLE", "") if g.get("allowSale") else ("SOON", "")
+
+
+def parse_sporting_api(data, src: "Source", details: dict | None = None) -> list[Event]:
+    """Parse tickets.sporting.pt allopengames JSON (+ per-game page data)."""
+    details = details or {}
+    events: list[Event] = []
+    for g in _sporting_games(data):
         home = _norm_ws(str((g.get("homeTeam") or {}).get("name", "")))
         away = _norm_ws(str((g.get("awayTeam") or {}).get("name", "")))
         title = " x ".join(t for t in (home, away) if t) or "Sporting CP"
-        # "disabledReasonDesc" is the label on the site's disabled buy button
-        # ("Brevemente disponível", "Esgotado", …). allowSale stays true even
-        # then, so a reason means "not buyable right now".
-        reason = _norm_ws(str(g.get("disabledReasonDesc") or ""))
-        if g.get("soldOut") or _contains_any(reason, SOLD_OUT_WORDS):
-            status = "SOLD_OUT"
-        elif reason or not g.get("allowSale"):
-            status = "SOON"
-        else:
-            status = "AVAILABLE"
-        comp = _norm_ws(str(g.get("competition", "")))
-        if g.get("member") and not g.get("public"):
-            comp = f"{comp} · members (sócios) only" if comp else "members (sócios) only"
-        if status == "SOON" and reason:
-            label = "coming soon" if "brevemente" in reason.lower() else reason
-            comp = f"{comp} · site: {label}" if comp else f"site: {label}"
+        token = str(g.get("token") or "").strip()
+        status, note = _sporting_status(g, details.get(token))
+        notes = [_norm_ws(str(g.get("competition", "")))]
+        if g.get("member") and not g.get("public") and "members" not in note:
+            notes.append("members (sócios) only")
+        notes.append(note)
+        comp = " · ".join(n for n in notes if n)
         when = _fmt_iso_datetime(str(g.get("date", "")))
         eid = str(g.get("id") or _event_id("", f"{title}-{g.get('date','')}"))
+        url = SPORTING_BUY_URL.format(token=token) if token else (src.browse_url or src.url)
         context = _norm_ws(f"{title} {comp} {g.get('modality','')}")
-        events.append(Event(eid, title, src.browse_url or src.url, when or None,
-                            status, context, extra=comp,
-                            start=_parse_start(g.get("date"))))
+        events.append(Event(eid, title, url, when or None, status, context,
+                            extra=comp, start=_parse_start(g.get("date"))))
     return events
 
 
@@ -788,7 +865,8 @@ def parse_fcporto(data, src: "Source") -> list[Event]:
                 notes.append(f"site status: {raw or '?'}")
             start = _parse_start(g.get("localStartsAt"))
             eid = str(g.get("id") or _event_id("", f"{title}-{g.get('localStartsAt')}"))
-            events.append(Event(eid, title, f"https://bilhetes.fcporto.pt/jogos/{eid}",
+            # "/comprar" is the purchase flow behind the match page's buy button.
+            events.append(Event(eid, title, f"https://bilhetes.fcporto.pt/jogos/{eid}/comprar",
                                 start.astimezone(LISBON).strftime("%d.%m %H:%M") if start else None,
                                 status, _norm_ws(f"{title} {comp} {raw}"),
                                 extra=" · ".join(notes), start=start))
@@ -965,7 +1043,7 @@ def fetch_source_json(src: "Source") -> str:
 
 def parse_source_json(data, src: "Source") -> list[Event]:
     if src.parser == "sporting_api":
-        return parse_sporting_api(data, src)
+        return parse_sporting_api(data, src, details=fetch_sporting_details(data))
     if src.parser == "fcporto":
         return parse_fcporto(data, src)
     return parse_json_events(data, src)
@@ -992,7 +1070,7 @@ def matches_keywords(event: Event, src: "Source") -> bool:
 # --------------------------------------------------------------------------- #
 
 
-def telegram_send(cfg: Config, text: str) -> bool:
+def telegram_send(cfg: Config, text: str, preview: bool = True) -> bool:
     if not cfg.telegram_token or not cfg.telegram_chat:
         log.error("Telegram token/chat id not configured; cannot send message.")
         return False
@@ -1001,7 +1079,7 @@ def telegram_send(cfg: Config, text: str) -> bool:
         "chat_id": cfg.telegram_chat,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False,
+        "disable_web_page_preview": not preview,
     }
     for attempt in range(1, 4):
         try:
@@ -1028,7 +1106,7 @@ def format_notification(event: Event, source_name: str) -> str:
         lines.append(f"\U0001F4C5 {_esc(event.date)}")
     if event.url:
         lines.append("")
-        lines.append(f'\U0001F517 <a href="{_esc(event.url)}">Buy now</a>')
+        lines.append(f'\U0001F517 <a href="{_esc(event.url)}">Buy tickets</a>')
     return "\n".join(lines)
 
 
@@ -1365,7 +1443,10 @@ def _summary_block(src: "Source", matched: list) -> str:
     for ev in matched:
         dot = _STATUS_DOT.get(ev.status, "⚪️")
         when = f"<b>{_esc(ev.date)}</b>  " if ev.date else ""
-        lines.append(f"{dot} {when}{_esc(ev.title)}")
+        name = _esc(ev.title)
+        if ev.url:  # tap the match to open its ticket page
+            name = f'<a href="{_esc(ev.url)}">{name}</a>'
+        lines.append(f"{dot} {when}{name}")
         if ev.extra:
             lines.append(f"      <i>{_esc(ev.extra)}</i>")
     return "\n".join(lines)
@@ -1477,7 +1558,7 @@ def run_normal(cfg: Config) -> int:
         header = (f"🔎 <b>Ticket check</b> · {now_lisbon.strftime('%H:%M %d.%m')}\n"
                   f"{_totals_line(statuses)}")
         for msg in _pack_messages(header, blocks):
-            telegram_send(cfg, msg)
+            telegram_send(cfg, msg, preview=False)  # many links: no preview card
 
     if _prune_state(state, now_iso):
         dirty = True
