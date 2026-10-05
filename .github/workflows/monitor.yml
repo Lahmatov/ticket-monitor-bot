@@ -5,15 +5,11 @@ name: Ticket monitor
 
 on:
   schedule:
-    # Times are UTC. Lisbon is UTC+0 (winter) / UTC+1 (summer); the script does
-    # the final day/night gating in Europe/Lisbon time, so these only need to be
-    # a superset of the moments we want to act on.
-    #
-    # Fire every 20 min; monitor.py gates to ~40 min by day / ~2 h at night
-    # (Europe/Lisbon, DST-correct). Day window in UTC covers WET & WEST.
-    - cron: "*/20 5-23 * * *"
-    # Night: hourly; the script throttles it to ~2 h.
-    - cron: "0 0,1,2,3,4 * * *"
+    # GitHub fires scheduled runs only every few hours in practice, so cron is
+    # just a safety net. The real cadence comes from the job itself: a normal
+    # run loops for ~5.5 h (checking every ~40 min by day / ~2 h at night,
+    # Europe/Lisbon) and then dispatches its own successor (see last step).
+    - cron: "17 */3 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -30,17 +26,23 @@ on:
         type: string
         default: ""
 
+# One monitor at a time; a run triggered while one is active waits its turn.
 concurrency:
   group: ticket-monitor
   cancel-in-progress: false
 
 permissions:
   contents: read
+  actions: write  # dispatch the next loop run / keep the schedule enabled
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Loop runs last LOOP_MINUTES; other modes take seconds.
+    timeout-minutes: 350
+    env:
+      LOOP_MINUTES: "330"
+      IS_LOOP: ${{ github.event_name == 'schedule' || inputs.mode == 'normal' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -73,11 +75,15 @@ jobs:
           PROBE_URL: ${{ inputs.probe_url }}
           PROBE_GREP: ${{ inputs.probe_grep }}
         run: |
-          python monitor.py --mode "${{ inputs.mode || 'normal' }}"
+          if [ "$IS_LOOP" = "true" ]; then
+            python monitor.py --mode normal --loop-minutes "$LOOP_MINUTES"
+          else
+            python monitor.py --mode "${{ inputs.mode }}"
+          fi
 
       # Save updated state only when it actually changed (keeps cache churn low).
       - name: Save state
-        if: steps.run.outputs.state_changed == 'true'
+        if: (success() || failure()) && steps.run.outputs.state_changed == 'true'
         uses: actions/cache/save@v4
         with:
           path: state.json
@@ -91,3 +97,21 @@ jobs:
           name: diagnostic-html
           path: "*-page.html"
           if-no-files-found: warn
+
+      # Hand over to the next loop run so checks continue without waiting for
+      # GitHub's cron. Skipped when the run was cancelled, so cancelling a run
+      # (or disabling the workflow) stops the chain.
+      - name: Start next loop run
+        if: (success() || failure()) && env.IS_LOOP == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run monitor.yml --ref "${{ github.ref_name }}" -f mode=normal
+
+      # Scheduled workflows are auto-disabled after 60 days without commits;
+      # re-enabling keeps the safety-net cron alive.
+      - name: Keep schedule enabled
+        if: env.IS_LOOP == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/monitor.yml/enable"

@@ -6,12 +6,14 @@ Watches the Portuguese Football Federation ticketing site
 (https://bilheteira.fpf.pt/) for Portugal national-team matches and sends a
 Telegram message as soon as a match becomes buyable.
 
-Runs as a short-lived job (see the GitHub Actions workflow) rather than a
-long-lived bot: each invocation fetches the listing once, compares it against
-persisted state, notifies about anything newly on sale, and exits.
+Runs inside a GitHub Actions job. With ``--loop-minutes N`` the job stays
+alive for N minutes and checks whenever the cadence below says a check is due
+(GitHub's own cron is too unreliable to drive the cadence by itself); without
+it, one invocation checks once and exits. Matches that were already played
+are hidden.
 
 Cadence (enforced here, not by cron, so it is correct across DST):
-  * Daytime in Lisbon (07:00-00:00): act on every scheduled run.
+  * Daytime in Lisbon (07:00-00:00): about every 40 minutes.
   * Night in Lisbon   (00:00-07:00): act at most once every ~2 hours.
 
 Modes (``--mode``):
@@ -63,8 +65,15 @@ from bs4 import BeautifulSoup
 LISBON = ZoneInfo("Europe/Lisbon")
 
 # Minimum spacing between checks (enforced here, not by cron).
-DAY_MIN_INTERVAL_MIN = 38     # ~40 min during the day (slack for cron jitter)
-NIGHT_MIN_INTERVAL_MIN = 115  # ~2h at night (Lisbon 00:00-07:00)
+DAY_MIN_INTERVAL_MIN = 40     # ~40 min during the day
+NIGHT_MIN_INTERVAL_MIN = 120  # ~2h at night (Lisbon 00:00-07:00)
+
+# --loop mode: how often the long-running job wakes up to see if a check is due.
+LOOP_POLL_SEC = 60
+
+# A match is hidden once it kicked off more than this long ago (some ticket
+# APIs keep a game "open" for a while after it was played).
+PAST_GRACE_HOURS = 3
 
 # Network
 REQUEST_TIMEOUT = 25
@@ -307,7 +316,7 @@ def should_act(now_lisbon: datetime, state: dict) -> tuple[bool, bool]:
     if last is not None:
         elapsed_min = (_now_utc() - last).total_seconds() / 60.0
         if elapsed_min < interval:
-            log.info("Run skipped: only %.0f min since last check (< %d).",
+            log.debug("Run skipped: only %.0f min since last check (< %d).",
                      elapsed_min, interval)
             return False, is_night
     return True, is_night
@@ -345,9 +354,9 @@ def fetch(url: str, accept: str = "text/html,application/xhtml+xml") -> str:
 
 
 class Event:
-    __slots__ = ("id", "title", "url", "date", "status", "context", "extra")
+    __slots__ = ("id", "title", "url", "date", "status", "context", "extra", "start")
 
-    def __init__(self, id_, title, url, date, status, context, extra=""):
+    def __init__(self, id_, title, url, date, status, context, extra="", start=None):
         self.id = id_
         self.title = title
         self.url = url
@@ -355,6 +364,7 @@ class Event:
         self.status = status
         self.context = context
         self.extra = extra  # optional secondary line (competition, time, …)
+        self.start = start  # aware datetime of kick-off, if known
 
     def __repr__(self) -> str:
         return f"<Event {self.status} {self.title!r} {self.date} {self.url}>"
@@ -543,8 +553,11 @@ def parse_json_events(data, src: "Source") -> list[Event]:
         comp = _first_str(item, ("competition", "competicao", "competição",
                                  "stage", "phase", "venue", "local", "stadium",
                                  "estadio", "location"))
-        events.append(Event(str(eid), title, url, date or None,
-                            _json_status(item), context[:400], extra=comp))
+        start = _parse_start(date)
+        shown = _fmt_iso_datetime(date) if start else date
+        events.append(Event(str(eid), title, url, shown or None,
+                            _json_status(item), context[:400], extra=comp,
+                            start=start))
     return events
 
 
@@ -614,6 +627,29 @@ def _fmt_iso_datetime(value: str) -> str:
         return value or ""
 
 
+def _parse_start(value) -> datetime | None:
+    """ISO date/time -> aware datetime; naive values are Lisbon local time."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=LISBON)
+
+
+def drop_past(events: list[Event], now: datetime | None = None) -> list[Event]:
+    """Remove matches that were already played; keep undated ones. Sort by date."""
+    now = now or _now_utc()
+    cutoff_sec = PAST_GRACE_HOURS * 3600
+    kept = [e for e in events
+            if e.start is None or (now - e.start).total_seconds() <= cutoff_sec]
+    if len(kept) != len(events):
+        log.info("Dropped %d already-played match(es).", len(events) - len(kept))
+    far = datetime.max.replace(tzinfo=timezone.utc)
+    return sorted(kept, key=lambda e: e.start or far)
+
+
 def parse_sporting_api(data, src: "Source") -> list[Event]:
     """Parse tickets.sporting.pt /api/match/allopengames JSON (all open games)."""
     games = []
@@ -646,7 +682,8 @@ def parse_sporting_api(data, src: "Source") -> list[Event]:
         eid = str(g.get("id") or _event_id("", f"{title}-{g.get('date','')}"))
         context = _norm_ws(f"{title} {comp} {g.get('modality','')}")
         events.append(Event(eid, title, src.browse_url or src.url, when or None,
-                            status, context, extra=comp))
+                            status, context, extra=comp,
+                            start=_parse_start(g.get("date"))))
     return events
 
 
@@ -692,6 +729,11 @@ def parse_sporting_dom(html: str, src: "Source") -> list[Event]:
 
 
 def load_events(src: "Source") -> list[Event]:
+    """Fetch and parse upcoming events (already-played matches are dropped)."""
+    return drop_past(_load_events_raw(src))
+
+
+def _load_events_raw(src: "Source") -> list[Event]:
     """Fetch and parse events for a source (JSON API, browser render, or HTML)."""
     if src.api_type == "json" and src.api_url:
         raw = fetch(src.api_url, accept="application/json, text/plain, */*")
@@ -849,10 +891,13 @@ def run_diagnostic(cfg: Config, dump_file: str | None) -> int:
                 _diag_hints(page)
             events = parse_events(page, src.url, src)
             print(f"\nParsed {len(events)} candidate event link(s):\n")
+        upcoming = drop_past(events)
         for ev in events:
             star = "  <-- keyword match" if matches_keywords(ev, src) else ""
+            if ev not in upcoming:
+                star = "  (already played -> hidden)"
             print(f"[{ev.status:9}] {ev.title[:70]!r} | {ev.date} | {ev.url}{star}")
-        matched = [e for e in events if matches_keywords(e, src)]
+        matched = [e for e in upcoming if matches_keywords(e, src)]
         kw = src.keywords or "(all events)"
         print(f"\nKeywords {kw}: {len(matched)} match; "
               f"available now: {sum(1 for e in matched if e.status == 'AVAILABLE')}")
@@ -1151,6 +1196,26 @@ def run_normal(cfg: Config) -> int:
     return 0
 
 
+def run_loop(cfg: Config, minutes: float) -> int:
+    """Stay alive for `minutes`, running a check whenever one is due.
+
+    GitHub's cron fires every few hours at best, so instead of relying on it
+    the job itself keeps the ~40 min / ~2 h cadence via should_act().
+    """
+    deadline = time.monotonic() + minutes * 60
+    log.info("Loop mode: running for %.0f min.", minutes)
+    while True:
+        try:
+            run_normal(cfg)
+        except Exception:  # noqa: BLE001 - one bad check must not end the loop
+            log.exception("Check failed; will retry on the next tick.")
+        if time.monotonic() + LOOP_POLL_SEC >= deadline:
+            break
+        time.sleep(LOOP_POLL_SEC)
+    log.info("Loop mode: done.")
+    return 0
+
+
 def _prune_state(state: dict, now_iso: str) -> bool:
     now = _parse_iso(now_iso) or _now_utc()
     changed = False
@@ -1186,6 +1251,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mode",
                         choices=("normal", "diagnostic", "test", "chatid", "probe"),
                         default="normal")
+    parser.add_argument("--loop-minutes", type=float, default=0,
+                        help="normal mode: keep running this long, checking "
+                             "whenever the day/night interval is due.")
     parser.add_argument("--dump-file", default="page.html",
                         help="Diagnostic mode writes <source_id>-<dump-file>.")
     args = parser.parse_args(argv)
@@ -1205,6 +1273,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_chatid(cfg)
     if args.mode == "test":
         return run_test(cfg)
+    if args.loop_minutes > 0:
+        return run_loop(cfg, args.loop_minutes)
     return run_normal(cfg)
 
 
