@@ -81,6 +81,30 @@ def explore(browser, url):
         seen.add(href)
         if LINK_RE.search(href):
             print("   ", href[:150], "|", re.sub(r"\s+", " ", a.inner_text())[:60])
+    n_cards = int(os.environ.get("CARD_DUMP", "3"))
+    if n_cards:
+        print(f"### CARD HTML (first {n_cards} cards around matching links):")
+        dumped = 0
+        for a in page.query_selector_all("a[href]"):
+            if dumped >= n_cards or not LINK_RE.search(a.get_attribute("href") or ""):
+                continue
+            html = a.evaluate("""el => {
+                let n = el;
+                for (let i = 0; i < 8 && n.parentElement; i++) {
+                    n = n.parentElement;
+                    if ((n.innerText || '').length > 120) break;
+                }
+                const c = n.cloneNode(true);
+                c.querySelectorAll('script,style,svg,img,picture,source').forEach(x => x.remove());
+                c.querySelectorAll('*').forEach(x => {
+                    for (const at of [...x.attributes])
+                        if (!['class','href','id','disabled','data-status'].includes(at.name)) x.removeAttribute(at.name);
+                });
+                return c.outerHTML;
+            }""")
+            print("----- card", dumped + 1, "-----")
+            print(re.sub(r"\s+", " ", html)[:int(os.environ.get("CARD_CHARS", "2500"))])
+            dumped += 1
     print(f"### {len(captured)} data responses:")
     for c in captured:
         print(c)
