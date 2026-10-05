@@ -13,6 +13,7 @@ from playwright.sync_api import sync_playwright
 
 BODY_CHARS = int(os.environ.get("BODY_CHARS", "700"))
 LINK_RE = re.compile(os.environ.get("LINK_RE", r"bilhete|ticket|/event"), re.I)
+ONLY_RE = re.compile(os.environ["ONLY_RE"], re.I) if os.environ.get("ONLY_RE") else None
 URLS = [u.strip() for u in os.environ.get("EXPLORE_URLS", "").split(",") if u.strip()]
 NOISE = ("google", "facebook", "doubleclick", "hotjar", "clarity", "analytics",
          "cookiebot", "onetrust", "gtm", "tiktok", "linkedin", "sentry", "fonts.",
@@ -53,8 +54,13 @@ def explore(browser, url):
             body = resp.text()
         except Exception:  # noqa: BLE001
             body = "(no body)"
+        post = ""
+        if resp.request.method == "POST" and resp.request.post_data:
+            post = "\n    POST BODY: " + re.sub(r"\s+", " ", resp.request.post_data)[:4000]
+        if ONLY_RE and not ONLY_RE.search(u + post):
+            return
         captured.append(f"[{resp.status}] {resp.request.method} {u}  ({ctype[:30]}, "
-                        f"{len(body)}b)\n    {short(body, BODY_CHARS)}")
+                        f"{len(body)}b){post}\n    {short(body, BODY_CHARS)}")
 
     page.on("response", on_response)
     try:
