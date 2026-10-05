@@ -1,8 +1,10 @@
 # Ticket monitor → Telegram
 
-Следит за билетными сайтами (по умолчанию — сборная Португалии
-<https://bilheteira.fpf.pt/> и **Sporting CP**
-<https://www.sporting.pt/>) и присылает уведомление в Telegram, как только
+Следит за билетными сайтами — сборная Португалии
+<https://bilheteira.fpf.pt/>, **Sporting CP** <https://tickets.sporting.pt/pt>,
+**SL Benfica** <https://www.slbenfica.pt/pt-pt/bilhetes> и **FC Porto**
+<https://bilhetes.fcporto.pt/> (везде только основная мужская футбольная
+команда) — и присылает уведомление в Telegram (на английском), как только
 матч появляется в продаже. Источники задаются в `sources.json` — добавить ещё
 сайт можно, не трогая код (см. «Источники» ниже).
 
@@ -117,12 +119,29 @@ FPF — все матчи сборной по слову `portugal`; для Spor
 | `browser` | рендер `browse_url` в headless-Chromium, парс DOM | — (поддерживается, но сейчас не нужен; требует `playwright`) |
 | `html` | обычный GET + эвристический парс HTML | — (по умолчанию) |
 
-Оба сайта отдают JSON без браузера:
-- **FPF** — `https://bilheteira.fpf.pt/public/Event` (общий JSON-разбор).
-- **Sporting** — `https://tickets.sporting.pt/api/match/allopengames`, разбор
-  `parser: "sporting_api"`: берёт **все** открытые игры, оставляет только
-  `modality = Futebol`, статус из `soldOut`/`allowSale`, помечает продажи
-  «только для sócios».
+Все сайты читаются без браузера:
+- **FPF** — `https://bilheteira.fpf.pt/public/Event` (общий JSON-разбор;
+  `isSoldOut` = распродано).
+- **Sporting** — `https://tickets.sporting.pt/api/match/allopengames`,
+  `parser: "sporting_api"`: все открытые игры, только `modality = Futebol`;
+  статус из `soldOut` / `allowSale` **и** `disabledReasonDesc` (надпись на
+  неактивной кнопке «Brevemente disponível», «Esgotado»).
+- **Benfica** — HTML `https://www.slbenfica.pt/pt-pt/bilhetes`,
+  `parser: "benfica"`: только вкладка «Equipa A»; статус из плашки карточки
+  (Esgotado → распродано, Mercado Secundário → 🟠 только перепродажа,
+  Por iniciar → скоро, Exclusivo a … → в продаже с пометкой). Год на сайте не
+  указан — берётся ближайший к сегодняшней дате.
+- **FC Porto** — GraphQL `https://bilhetes-api.fcporto.pt/api/graphql`
+  (тот же запрос `matchesByDate`, что делает сайт), `parser: "fcporto"`:
+  только матчи, где одна из команд ровно «FC Porto»; статус из поля `status`
+  (неизвестные значения показываются как есть).
+
+Уже сыгранные матчи (начались > 3 ч назад) скрываются. Если матч перестал быть
+доступен (распродан/закрыт), бот его «забывает» — при возврате билетов придёт
+новый алерт.
+
+Разведка нового сайта: workflow **Explore ticket site (one-off)** открывает
+страницу в Chromium и печатает в лог все JSON/API-запросы, которые она делает.
 
 Общие поля:
 

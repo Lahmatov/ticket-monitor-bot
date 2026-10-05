@@ -804,8 +804,8 @@ _PT_DATE_RE = re.compile(
 def _parse_pt_datetime(text: str, now: datetime | None = None) -> datetime | None:
     """'Dom 11 Out 18h00' / '20 de outubro às 20:00' -> aware Lisbon datetime.
 
-    The year is not shown on these sites: pick the one that puts the match
-    closest to now (a date >60 days in the past means next year).
+    The year is not shown on these sites: pick the year that puts the match
+    closest to now (stale cards from last season then read as already played).
     """
     m = _PT_DATE_RE.search(text or "")
     if not m:
@@ -814,14 +814,16 @@ def _parse_pt_datetime(text: str, now: datetime | None = None) -> datetime | Non
     if not month:
         return None
     now = (now or _now_utc()).astimezone(LISBON)
-    try:
-        dt = datetime(now.year, month, int(m.group(1)), int(m.group(3)),
-                      int(m.group(4)), tzinfo=LISBON)
-    except ValueError:
+    candidates = []
+    for year in (now.year - 1, now.year, now.year + 1):
+        try:
+            candidates.append(datetime(year, month, int(m.group(1)), int(m.group(3)),
+                                       int(m.group(4)), tzinfo=LISBON))
+        except ValueError:  # e.g. 29 Feb in a non-leap year
+            continue
+    if not candidates:
         return None
-    if (now - dt).days > 60:
-        dt = dt.replace(year=dt.year + 1)
-    return dt
+    return min(candidates, key=lambda d: abs((d - now).total_seconds()))
 
 
 # Benfica status badge (div.button-type-container) -> (status, note)
