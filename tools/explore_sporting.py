@@ -75,7 +75,7 @@ with sync_playwright() as p:
     if card.count():
         # climb to an ancestor that contains a clickable button
         for depth in range(1, 8):
-            anc = card.locator("xpath=" + "/..".join([""] * (depth + 1)) if depth else ".")
+            anc = card.locator("xpath=" + "/".join([".."] * depth))
             btns = anc.locator("button, a")
             if btns.count():
                 for i in range(btns.count()):
