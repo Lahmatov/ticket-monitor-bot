@@ -79,7 +79,9 @@ def explore(browser, url):
     for label in [c for c in os.environ.get("CLICKS", "").split(";;") if c.strip()]:
         label = label.strip()
         target = None
-        for loc in (page.get_by_text(label, exact=True), page.get_by_text(label)):
+        locs = ((page.locator(label[4:]),) if label.startswith("css=")
+                else (page.get_by_text(label, exact=True), page.get_by_text(label)))
+        for loc in locs:
             try:
                 if loc.count():
                     target = loc.first
