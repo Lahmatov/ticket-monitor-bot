@@ -705,6 +705,13 @@ _FPF_NOT_A_TEAM_COMP = re.compile(r"\bS\d{2}\b|\bsub[- ]?\d{2}|\bU\d{2}\b|femin|
                                   re.I)
 
 
+def _fmt_sale_opens(dt: datetime) -> str:
+    """'sale opens Fri 6 Nov, 00:00' (Lisbon) - month spelled out so it can't
+    be mistaken for today's dd.mm date."""
+    d = dt.astimezone(LISBON)
+    return f"sale opens {d.strftime('%a')} {d.day} {d.strftime('%b')}, {d.strftime('%H:%M')}"
+
+
 def parse_fpf_odata(data, src: "Source") -> list[Event]:
     """Parse score2-external-api.fpf.pt .../odata/Events (new FPF site, 2026-10).
 
@@ -733,7 +740,7 @@ def parse_fpf_odata(data, src: "Source") -> list[Event]:
             status = "SOLD_OUT"
         elif sale_start and now < sale_start:
             status = "SOON"
-            note = "sale opens " + sale_start.astimezone(LISBON).strftime("%d.%m %H:%M")
+            note = _fmt_sale_opens(sale_start)
         elif sale_end and now > sale_end:
             status, note = "SOLD_OUT", "online sale closed"
         else:
@@ -931,7 +938,7 @@ def parse_fcporto(data, src: "Source") -> list[Event]:
                             str(g.get("competitionPhase") or "")) if x))
             notes = [comp] if comp else []
             if status == "SOON" and sale_start and sale_start > now:
-                notes.append("sale opens " + sale_start.astimezone(LISBON).strftime("%d.%m %H:%M"))
+                notes.append(_fmt_sale_opens(sale_start))
             if status == "UNKNOWN":
                 notes.append(f"site status: {raw or '?'}")
             start = _parse_start(g.get("localStartsAt"))
