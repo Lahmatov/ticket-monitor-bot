@@ -13,8 +13,8 @@ it, one invocation checks once and exits. Matches that were already played
 are hidden.
 
 Cadence (enforced here, not by cron, so it is correct across DST):
-  * Daytime in Lisbon (07:00-00:00): about every 40 minutes.
-  * Night in Lisbon   (00:00-07:00): act at most once every ~2 hours.
+  * Daytime in Lisbon (07:00-00:00): every 20-40 minutes (random).
+  * Night in Lisbon   (00:00-07:00): every 100-140 minutes (random).
 
 Modes (``--mode``):
   * normal      – the real thing: fetch, detect, notify.
@@ -50,6 +50,7 @@ import logging
 import os
 import re
 import sys
+import random
 import time
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
@@ -65,8 +66,10 @@ from bs4 import BeautifulSoup
 LISBON = ZoneInfo("Europe/Lisbon")
 
 # Minimum spacing between checks (enforced here, not by cron).
-DAY_MIN_INTERVAL_MIN = 40     # ~40 min during the day
-NIGHT_MIN_INTERVAL_MIN = 120  # ~2h at night (Lisbon 00:00-07:00)
+# Gap between checks is drawn at random from these ranges (minutes) after
+# every check, so the sites don't see a clockwork pattern.
+DAY_INTERVAL_RANGE_MIN = (20, 40)     # 07:00-00:00 Lisbon
+NIGHT_INTERVAL_RANGE_MIN = (100, 140)  # 00:00-07:00 Lisbon
 
 # --loop mode: how often the long-running job wakes up to see if a check is due.
 LOOP_POLL_SEC = 60
@@ -314,16 +317,28 @@ def save_state(path: str, state: dict) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def pick_next_gaps(state: dict) -> None:
+    """Draw the random day/night gaps to wait after the check just made."""
+    state["next_gap_day_min"] = round(random.uniform(*DAY_INTERVAL_RANGE_MIN), 1)
+    state["next_gap_night_min"] = round(random.uniform(*NIGHT_INTERVAL_RANGE_MIN), 1)
+
+
 def should_act(now_lisbon: datetime, state: dict) -> tuple[bool, bool]:
-    """Return (act, is_night). Enforces the day/night min-interval, DST-correct."""
+    """Return (act, is_night). Enforces the random day/night gap, DST-correct."""
     is_night = now_lisbon.hour < 7  # 00:00-06:59 Lisbon
-    interval = NIGHT_MIN_INTERVAL_MIN if is_night else DAY_MIN_INTERVAL_MIN
+    lo, hi = NIGHT_INTERVAL_RANGE_MIN if is_night else DAY_INTERVAL_RANGE_MIN
+    key = "next_gap_night_min" if is_night else "next_gap_day_min"
+    try:
+        interval = float(state.get(key) or hi)
+    except (TypeError, ValueError):
+        interval = hi
+    interval = min(max(interval, lo), hi)  # stale/odd stored values stay in range
     last = _parse_iso(state.get("last_check_utc"))
     if last is not None:
         elapsed_min = (_now_utc() - last).total_seconds() / 60.0
         if elapsed_min < interval:
-            log.debug("Run skipped: only %.0f min since last check (< %d).",
-                     elapsed_min, interval)
+            log.debug("Run skipped: only %.0f min since last check (< %.0f).",
+                      elapsed_min, interval)
             return False, is_night
     return True, is_night
 
@@ -1630,6 +1645,7 @@ def run_normal(cfg: Config) -> int:
         return 0
 
     state["last_check_utc"] = _now_utc().isoformat()  # for the min-interval gate
+    pick_next_gaps(state)
     dirty = True
 
     now_iso = _now_utc().isoformat()
@@ -1678,7 +1694,7 @@ def run_loop(cfg: Config, minutes: float) -> int:
     """Stay alive for `minutes`, running a check whenever one is due.
 
     GitHub's cron fires every few hours at best, so instead of relying on it
-    the job itself keeps the ~40 min / ~2 h cadence via should_act(). Ends
+    the job itself keeps the random 20-40 min / 100-140 min cadence via should_act(). Ends
     early when a source keeps failing (see _should_rotate); the workflow then
     starts the next run on a different machine.
     """

@@ -7,7 +7,7 @@ on:
   schedule:
     # GitHub fires scheduled runs only every few hours in practice, so cron is
     # just a safety net. The real cadence comes from the job itself: a normal
-    # run loops for ~5.5 h (checking every ~40 min by day / ~2 h at night,
+    # run loops for ~5.5 h (checking every 20-40 min by day / 100-140 min at night, random,
     # Europe/Lisbon) and then dispatches its own successor (see last step).
     - cron: "17 */3 * * *"
   workflow_dispatch:
