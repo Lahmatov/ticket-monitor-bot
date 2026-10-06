@@ -287,9 +287,14 @@ class Config:
                                if c]
         self.telegram_chat = self.telegram_chats[0] if self.telegram_chats else ""
         self.subscribers: list[str] = []  # approved via the bot (from state)
-        # Send a summary of every check (even when nothing is on sale).
-        self.report_every_run = os.environ.get("REPORT_EVERY_RUN", "").strip().lower() \
-            in ("1", "true", "yes", "on")
+        # REPORT_MODE: "changes" (default) = message only when a match's status
+        # changes or a new match appears; "every" = full summary every check.
+        # (Legacy REPORT_EVERY_RUN=1 means "every".)
+        mode = os.environ.get("REPORT_MODE", "").strip().lower()
+        if not mode:
+            legacy = os.environ.get("REPORT_EVERY_RUN", "").strip().lower()
+            mode = "every" if legacy in ("1", "true", "yes", "on") else "changes"
+        self.report_mode = mode if mode in ("changes", "every") else "changes"
         self.sources = load_sources()
 
 
@@ -1607,6 +1612,9 @@ def _handle_message(cfg: Config, state: dict, msg: dict) -> None:
     cid, name = str(chat.get("id")), _chat_name(chat)
     text = (msg.get("text") or "").strip().lower()
     say = lambda t: _tg(cfg, "sendMessage", chat_id=cid, text=t)  # noqa: E731
+    if text == "/status" and (cid in cfg.telegram_chats or cid in state["subscribers"]):
+        _send_status(cfg, state, cid)
+        return
     if cid in cfg.telegram_chats:  # the owner (or a fixed recipient)
         if cid == cfg.telegram_chat and text in ("/list", "/subscribers"):
             _list_for_owner(cfg, state)
@@ -1619,7 +1627,8 @@ def _handle_message(cfg: Config, state: dict, msg: dict) -> None:
         state["pending"].pop(cid, None)
         return
     if cid in state["subscribers"]:
-        say("✅ You already receive the ticket updates. Send /stop to unsubscribe.")
+        say("✅ You already receive the ticket updates. Send /status for the "
+            "current overview, /stop to unsubscribe.")
     elif cid in state["pending"]:
         say("⏳ Your request is waiting for the owner's approval.")
     else:
@@ -1628,6 +1637,17 @@ def _handle_message(cfg: Config, state: dict, msg: dict) -> None:
             "Sporting, Benfica, Porto). Your request was sent to the owner - "
             "you'll get a message here once it's approved.")
         _ask_owner(cfg, cid, name)
+
+
+def _send_status(cfg: Config, state: dict, cid: str) -> None:
+    """Reply with the summary of the latest check."""
+    summary = state.get("last_summary") or []
+    if not summary:
+        telegram_send(cfg, "No check has finished yet - try again in a few minutes.",
+                      chats=[cid])
+        return
+    for msg in summary:
+        telegram_send(cfg, msg, preview=False, chats=[cid])
 
 
 def _handle_callback(cfg: Config, state: dict, cb: dict) -> None:
@@ -1643,8 +1663,9 @@ def _handle_callback(cfg: Config, state: dict, cb: dict) -> None:
     if action == "allow":
         state["subscribers"][cid] = {"name": name, "since": _now_utc().isoformat()}
         _tg(cfg, "sendMessage", chat_id=cid,
-            text="✅ Access granted! You'll now get the ticket check reports and an "
-                 "alert as soon as tickets go on sale. Send /stop to unsubscribe.")
+            text="✅ Access granted! You'll get a message as soon as tickets go on "
+                 "sale or a match's status changes. Send /status any time for the "
+                 "full overview, /stop to unsubscribe.")
         result = f"✅ Allowed: {name}"
     elif action == "deny":
         state["subscribers"].pop(cid, None)
@@ -1770,8 +1791,12 @@ def _pack_messages(header: str, blocks: list[str]) -> list[str]:
 
 
 def _process_source(cfg: Config, src: "Source", state: dict,
-                    now_iso: str) -> tuple[bool, str, list[str]]:
-    """Check one source; return (state_changed, report_block, statuses)."""
+                    now_iso: str) -> tuple[bool, str, list[str], list | None]:
+    """Check one source.
+
+    Returns (state_changed, report_block, statuses, matched_events); the
+    events are None when the site could not be read.
+    """
     notified = state["notified"]
     failures = state["failures"]
     dirty = False
@@ -1786,7 +1811,7 @@ def _process_source(cfg: Config, src: "Source", state: dict,
                "server automatically" if isinstance(err, SiteBlockedError)
                else _esc(str(err)[:100]))
         return True, (f"{_source_heading(src)}\n⚠️ could not read the site "
-                      f"<i>({why})</i>"), []
+                      f"<i>({why})</i>"), [], None
 
     if failures.get(src.id):
         failures[src.id] = 0
@@ -1822,7 +1847,7 @@ def _process_source(cfg: Config, src: "Source", state: dict,
             # a new sale phase) trigger a fresh alert.
             del notified[key]
             dirty = True
-    return dirty, _summary_block(src, matched), [e.status for e in matched]
+    return dirty, _summary_block(src, matched), [e.status for e in matched], matched
 
 
 def run_normal(cfg: Config) -> int:
@@ -1844,17 +1869,33 @@ def run_normal(cfg: Config) -> int:
     now_iso = _now_utc().isoformat()
     blocks: list[str] = []
     statuses: list[str] = []
+    found: dict[str, list | None] = {}
     for src in cfg.sources:
-        changed, block, sts = _process_source(cfg, src, state, now_iso)
+        changed, block, sts, events = _process_source(cfg, src, state, now_iso)
         dirty = dirty or changed
         blocks.append(block)
         statuses.extend(sts)
+        found[src.id] = events
 
-    if cfg.report_every_run:
-        header = (f"🔎 <b>Ticket check</b> · {now_lisbon.strftime('%H:%M %d.%m')}\n"
-                  f"{_totals_line(statuses)}")
-        for msg in _pack_messages(header, blocks):
+    header = (f"🔎 <b>Ticket check</b> · {now_lisbon.strftime('%H:%M %d.%m')}\n"
+              f"{_totals_line(statuses)}")
+    summary = _pack_messages(header, blocks)
+    state["last_summary"] = summary  # served by /status
+    first_snapshot = "snapshot" not in state
+    change_blocks = _diff_snapshot(cfg, state, found)
+    if cfg.report_mode == "every":
+        for msg in summary:
             telegram_send(cfg, msg, preview=False)  # many links: no preview card
+    elif first_snapshot:
+        intro = ("ℹ️ <b>From now on you'll only get a message when something "
+                 "changes</b> (tickets go on sale, a match sells out, a new match "
+                 "appears...). Send /status any time for the full overview.\n\n")
+        for i, msg in enumerate(summary):
+            telegram_send(cfg, (intro if i == 0 else "") + msg, preview=False)
+    elif change_blocks:
+        head = f"🔔 <b>Changes</b> · {now_lisbon.strftime('%H:%M %d.%m')}"
+        for msg in _pack_messages(head, change_blocks):
+            telegram_send(cfg, msg, preview=False)
 
     if _prune_state(state, now_iso):
         dirty = True
@@ -1863,6 +1904,52 @@ def run_normal(cfg: Config) -> int:
         save_state(cfg.state_file, state)
         set_output("state_changed", "true")
     return 0
+
+
+def _event_line(ev, prefix: str) -> list[str]:
+    when = f"<b>{_esc(ev.date)}</b>  " if ev.date else ""
+    name = f'<a href="{_esc(ev.url)}">{_esc(ev.title)}</a>' if ev.url else _esc(ev.title)
+    lines = [f"{prefix} {when}{name}"]
+    if ev.extra:
+        lines.append(f"      <i>{_esc(ev.extra)}</i>")
+    return lines
+
+
+def _diff_snapshot(cfg: Config, state: dict, found: dict) -> list[str]:
+    """Update state["snapshot"] and return per-team blocks of what changed.
+
+    A change is a new match or a status change. Changes *to* "on sale" are
+    left out: the dedicated "Tickets on sale!" alert already covers them.
+    A source that could not be read keeps its previous snapshot, so a site
+    hiccup doesn't look like every match vanished and came back.
+    """
+    old = state.get("snapshot") or {}
+    new: dict[str, dict] = {}
+    blocks = []
+    for src in cfg.sources:
+        events = found.get(src.id)
+        if events is None:
+            if src.id in old:
+                new[src.id] = old[src.id]
+            continue
+        before = old.get(src.id)
+        new[src.id] = {e.id: e.status for e in events}
+        if before is None:
+            continue  # first time we see this source: baseline only
+        lines = []
+        for ev in events:
+            prev = before.get(ev.id)
+            if prev == ev.status or ev.status == "AVAILABLE":
+                continue
+            dot = _STATUS_DOT.get(ev.status, "⚪️")
+            if prev is None:
+                lines += _event_line(ev, f"🆕 {dot}")
+            else:
+                lines += _event_line(ev, f"{_STATUS_DOT.get(prev, '⚪️')} → {dot}")
+        if lines:
+            blocks.append("\n".join([_source_heading(src)] + lines))
+    state["snapshot"] = new
+    return blocks
 
 
 def _should_rotate(state: dict, elapsed_min: float) -> str:
@@ -1894,6 +1981,11 @@ def run_loop(cfg: Config, minutes: float) -> int:
     started = time.monotonic()
     deadline = started + minutes * 60
     log.info("Loop mode: running for %.0f min.", minutes)
+    if cfg.telegram_token:  # command menu shown in Telegram's "/" button
+        _tg(cfg, "setMyCommands", commands=[
+            {"command": "status", "description": "Current ticket overview"},
+            {"command": "start", "description": "Ask for access"},
+            {"command": "stop", "description": "Stop receiving messages"}])
     while True:
         try:
             run_normal(cfg)

@@ -71,8 +71,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Send a summary of every check (set to "" to go back to quiet mode).
-          REPORT_EVERY_RUN: "1"
+          # "changes": message only when something changes (+ /status on
+          # demand); "every": full summary after every check.
+          REPORT_MODE: "changes"
           PROBE_URL: ${{ inputs.probe_url }}
           PROBE_GREP: ${{ inputs.probe_grep }}
         run: |
