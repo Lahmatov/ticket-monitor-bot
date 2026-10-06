@@ -70,6 +70,8 @@ NIGHT_MIN_INTERVAL_MIN = 120  # ~2h at night (Lisbon 00:00-07:00)
 
 # --loop mode: how often the long-running job wakes up to see if a check is due.
 LOOP_POLL_SEC = 60
+# --loop mode: a run may end early to escape an IP ban only after this long.
+ROTATE_MIN_ELAPSED_MIN = 20
 
 # A match is hidden once it kicked off more than this long ago (some ticket
 # APIs keep a game "open" for a while after it was played).
@@ -1025,7 +1027,7 @@ def load_events(src: "Source") -> list[Event]:
 def _load_events_raw(src: "Source") -> list[Event]:
     """Fetch and parse events for a source (JSON API, browser render, or HTML)."""
     if src.api_type == "json" and src.api_url:
-        return parse_source_json(json.loads(fetch_source_json(src)), src)
+        return parse_source_json(loads_json(fetch_source_json(src), src), src)
     if src.api_type == "browser":
         html = render_with_browser(src.browse_url, src.wait_selector, src.wait_ms)
         if src.parser == "sporting":
@@ -1033,6 +1035,30 @@ def _load_events_raw(src: "Source") -> list[Event]:
         return parse_events(html, src.browse_url, src)
     page = fetch(src.url)
     return parse_html_source(page, src)
+
+
+class SiteBlockedError(RuntimeError):
+    """The site answered with an anti-bot / IP-ban page instead of data."""
+
+
+_BLOCK_MARKERS = ("ip address has been banned", "access denied", "you have been blocked",
+                  "attention required", "cf-browser-verification", "request blocked",
+                  "captcha")
+
+
+def loads_json(raw: str, src: "Source"):
+    """json.loads with a readable error: says what the site sent instead."""
+    try:
+        return json.loads(raw)
+    except ValueError:
+        text = _norm_ws(BeautifulSoup(raw or "", "html.parser").get_text(" "))
+        low = (text or raw or "").lower()
+        if any(m in low for m in _BLOCK_MARKERS):
+            raise SiteBlockedError(
+                f"site blocked this server's IP: {text[:120]}") from None
+        raise RuntimeError(
+            f"expected JSON, got {('empty response' if not (raw or '').strip() else repr(text[:120]))}"
+        ) from None
 
 
 def fetch_source_json(src: "Source") -> str:
@@ -1143,7 +1169,7 @@ def run_diagnostic(cfg: Config, dump_file: str | None) -> int:
                 continue
             print(f"Fetched {len(raw)} bytes of JSON; head: {raw[:200]}")
             try:
-                events = parse_source_json(json.loads(raw), src)
+                events = parse_source_json(loads_json(raw, src), src)
             except Exception as err:  # noqa: BLE001
                 print(f"JSON parse failed: {err}")
                 continue
@@ -1495,12 +1521,17 @@ def _process_source(cfg: Config, src: "Source", state: dict,
     except Exception as err:  # noqa: BLE001 - handle any failure uniformly
         log.error("[%s] fetch/parse failed: %s", src.id, err)
         failures[src.id] = failures.get(src.id, 0) + 1
+        state.setdefault("blocked", {})[src.id] = isinstance(err, SiteBlockedError)
         _maybe_alert_failure(cfg, src, failures[src.id], err)
+        why = ("the site blocked this GitHub server's IP — switching to another "
+               "server automatically" if isinstance(err, SiteBlockedError)
+               else _esc(str(err)[:100]))
         return True, (f"{_source_heading(src)}\n⚠️ could not read the site "
-                      f"<i>({_esc(str(err)[:80])})</i>"), []
+                      f"<i>({why})</i>"), []
 
     if failures.get(src.id):
         failures[src.id] = 0
+        state.setdefault("blocked", {}).pop(src.id, None)
         dirty = True
 
     matched = [e for e in events if matches_keywords(e, src)]
@@ -1569,19 +1600,50 @@ def run_normal(cfg: Config) -> int:
     return 0
 
 
+def _should_rotate(state: dict, elapsed_min: float) -> str:
+    """Name of a source worth leaving this machine for, or "".
+
+    Sites like FPF ban individual GitHub runner IPs; a loop run keeps one IP
+    for hours, so it would stay blind. Ending the run early hands over to a
+    fresh run (usually on another machine/IP). A detected ban rotates after
+    one failed check, other errors after two; never more often than every
+    ROTATE_MIN_ELAPSED_MIN, so a real site outage can't cause a restart storm.
+    """
+    if elapsed_min < ROTATE_MIN_ELAPSED_MIN:
+        return ""
+    blocked = state.get("blocked") or {}
+    for sid, n in (state.get("failures") or {}).items():
+        if n >= (1 if blocked.get(sid) else 2):
+            return sid
+    return ""
+
+
 def run_loop(cfg: Config, minutes: float) -> int:
     """Stay alive for `minutes`, running a check whenever one is due.
 
     GitHub's cron fires every few hours at best, so instead of relying on it
-    the job itself keeps the ~40 min / ~2 h cadence via should_act().
+    the job itself keeps the ~40 min / ~2 h cadence via should_act(). Ends
+    early when a source keeps failing (see _should_rotate); the workflow then
+    starts the next run on a different machine.
     """
-    deadline = time.monotonic() + minutes * 60
+    started = time.monotonic()
+    deadline = started + minutes * 60
     log.info("Loop mode: running for %.0f min.", minutes)
     while True:
         try:
             run_normal(cfg)
         except Exception:  # noqa: BLE001 - one bad check must not end the loop
             log.exception("Check failed; will retry on the next tick.")
+        sid = _should_rotate(load_state(cfg.state_file),
+                             (time.monotonic() - started) / 60)
+        if sid:
+            log.warning("Loop mode: [%s] keeps failing here; ending early so "
+                        "the next run starts on another machine (new IP).", sid)
+            st = load_state(cfg.state_file)
+            st["last_check_utc"] = None  # let the next run re-check right away
+            save_state(cfg.state_file, st)
+            set_output("state_changed", "true")
+            break
         if time.monotonic() + LOOP_POLL_SEC >= deadline:
             break
         time.sleep(LOOP_POLL_SEC)
@@ -1609,7 +1671,8 @@ def _maybe_alert_failure(cfg: Config, src: "Source", n: int, err: Exception) -> 
         telegram_send(
             cfg,
             f"⚠️ <b>Ticket monitor</b> — {_esc(src.name)}\n"
-            f"Could not read the site {n} runs in a row.\n"
+            f"Could not read the site {n} checks in a row"
+            f"{' (it is blocking GitHub servers; the bot keeps switching servers)' if isinstance(err, SiteBlockedError) else ''}.\n"
             f"<code>{_esc(str(err))[:300]}</code>",
         )
 
