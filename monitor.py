@@ -286,6 +286,7 @@ class Config:
                                                    os.environ.get("TELEGRAM_CHAT_ID", ""))
                                if c]
         self.telegram_chat = self.telegram_chats[0] if self.telegram_chats else ""
+        self.subscribers: list[str] = []  # approved via the bot (from state)
         # Send a summary of every check (even when nothing is on sale).
         self.report_every_run = os.environ.get("REPORT_EVERY_RUN", "").strip().lower() \
             in ("1", "true", "yes", "on")
@@ -306,6 +307,9 @@ def load_state(path: str) -> dict:
     data.setdefault("notified", {})  # event_id -> {title,url,first_notified,last_seen}
     data.setdefault("last_check_utc", None)  # min-interval gate (day/night)
     data.setdefault("failures", {})  # source_id -> consecutive failure count
+    data.setdefault("subscribers", {})  # chat_id -> {name, since}: approved by owner
+    data.setdefault("pending", {})  # chat_id -> {name, requested}: awaiting owner
+    data.setdefault("tg_offset", 0)  # next Telegram update_id to read
     return data
 
 
@@ -1185,7 +1189,9 @@ def telegram_send(cfg: Config, text: str, preview: bool = True,
     True if at least one recipient got it, so one blocked/removed recipient
     can't make the owner's alerts repeat forever.
     """
-    chats = chats if chats is not None else cfg.telegram_chats
+    if chats is None:
+        chats = cfg.telegram_chats + [c for c in cfg.subscribers
+                                      if c not in cfg.telegram_chats]
     if not cfg.telegram_token or not chats:
         log.error("Telegram token/chat id not configured; cannot send message.")
         return False
@@ -1537,12 +1543,149 @@ def run_chatid(cfg: Config) -> int:
                       "separated by commas, yours first (e.g. <code>"
                       f"{_esc(cfg.telegram_chat)},123456789</code>)."]
         ok = telegram_send(cfg, "\n".join(lines), preview=False,
-                           chats=[cfg.telegram_chat])
+                           chats=[cfg.telegram_chat])  # owner only
         print("Full list sent to the owner's Telegram." if ok
               else "Could not send the list to Telegram.")
     else:
         print("Set TELEGRAM_CHAT_ID (your own id) to receive the full list in Telegram.")
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Access requests: anyone may ask with /start, the owner approves in Telegram #
+# --------------------------------------------------------------------------- #
+
+
+def _tg(cfg: Config, method: str, **params):
+    """Call a Telegram Bot API method; return its "result" or None."""
+    try:
+        resp = requests.post(f"https://api.telegram.org/bot{cfg.telegram_token}/{method}",
+                             json=params, timeout=REQUEST_TIMEOUT)
+        data = resp.json()
+    except (requests.RequestException, ValueError) as err:
+        log.warning("Telegram %s failed: %s", method, err)
+        return None
+    if not data.get("ok"):
+        log.warning("Telegram %s error: %s", method, str(data)[:200])
+        return None
+    return data.get("result")
+
+
+def _chat_name(chat: dict) -> str:
+    name = " ".join(filter(None, [chat.get("first_name"), chat.get("last_name")]))
+    if chat.get("username"):
+        name = f"{name} (@{chat['username']})" if name else f"@{chat['username']}"
+    return name or str(chat.get("id"))
+
+
+def _ask_owner(cfg: Config, cid: str, name: str) -> None:
+    _tg(cfg, "sendMessage", chat_id=cfg.telegram_chat, parse_mode="HTML",
+        text=f"🙋 <b>{_esc(name)}</b> wants to receive the ticket bot's messages.",
+        reply_markup={"inline_keyboard": [[
+            {"text": "✅ Allow", "callback_data": f"allow:{cid}"},
+            {"text": "❌ Deny", "callback_data": f"deny:{cid}"}]]})
+
+
+def _list_for_owner(cfg: Config, state: dict) -> None:
+    subs = state["subscribers"]
+    if not subs:
+        _tg(cfg, "sendMessage", chat_id=cfg.telegram_chat,
+            text="Nobody else receives the bot's messages yet.")
+        return
+    rows = [[{"text": f"❌ Remove {v.get('name', k)}"[:60], "callback_data": f"remove:{k}"}]
+            for k, v in subs.items()]
+    names = "\n".join(f"• {_esc(v.get('name', k))}" for k, v in subs.items())
+    _tg(cfg, "sendMessage", chat_id=cfg.telegram_chat, parse_mode="HTML",
+        text=f"👥 <b>Also receiving the bot's messages:</b>\n{names}",
+        reply_markup={"inline_keyboard": rows})
+
+
+def _handle_message(cfg: Config, state: dict, msg: dict) -> None:
+    chat = msg.get("chat") or {}
+    if chat.get("type") != "private":
+        return  # requests only from private chats
+    cid, name = str(chat.get("id")), _chat_name(chat)
+    text = (msg.get("text") or "").strip().lower()
+    say = lambda t: _tg(cfg, "sendMessage", chat_id=cid, text=t)  # noqa: E731
+    if cid in cfg.telegram_chats:  # the owner (or a fixed recipient)
+        if cid == cfg.telegram_chat and text in ("/list", "/subscribers"):
+            _list_for_owner(cfg, state)
+        return
+    if text == "/stop":
+        if state["subscribers"].pop(cid, None) is not None:
+            say("You're unsubscribed. Send /start to ask again.")
+            _tg(cfg, "sendMessage", chat_id=cfg.telegram_chat,
+                text=f"ℹ️ {name} unsubscribed.")
+        state["pending"].pop(cid, None)
+        return
+    if cid in state["subscribers"]:
+        say("✅ You already receive the ticket updates. Send /stop to unsubscribe.")
+    elif cid in state["pending"]:
+        say("⏳ Your request is waiting for the owner's approval.")
+    else:
+        state["pending"][cid] = {"name": name, "requested": _now_utc().isoformat()}
+        say("👋 Hi! This bot sends Portuguese football ticket alerts (Portugal, "
+            "Sporting, Benfica, Porto). Your request was sent to the owner - "
+            "you'll get a message here once it's approved.")
+        _ask_owner(cfg, cid, name)
+
+
+def _handle_callback(cfg: Config, state: dict, cb: dict) -> None:
+    owner_ok = str((cb.get("from") or {}).get("id")) == cfg.telegram_chat
+    action, _, cid = str(cb.get("data") or "").partition(":")
+    msg = cb.get("message") or {}
+    if not owner_ok or action not in ("allow", "deny", "remove") or not cid:
+        _tg(cfg, "answerCallbackQuery", callback_query_id=cb.get("id"),
+            text="Only the bot's owner can do that.")
+        return
+    info = state["pending"].pop(cid, None) or state["subscribers"].get(cid) or {}
+    name = info.get("name", cid)
+    if action == "allow":
+        state["subscribers"][cid] = {"name": name, "since": _now_utc().isoformat()}
+        _tg(cfg, "sendMessage", chat_id=cid,
+            text="✅ Access granted! You'll now get the ticket check reports and an "
+                 "alert as soon as tickets go on sale. Send /stop to unsubscribe.")
+        result = f"✅ Allowed: {name}"
+    elif action == "deny":
+        state["subscribers"].pop(cid, None)
+        _tg(cfg, "sendMessage", chat_id=cid,
+            text="Sorry, the owner didn't approve the request.")
+        result = f"❌ Denied: {name}"
+    else:  # remove
+        state["subscribers"].pop(cid, None)
+        _tg(cfg, "sendMessage", chat_id=cid,
+            text="The owner removed you from the ticket bot's recipients.")
+        result = f"🗑 Removed: {name}"
+    _tg(cfg, "answerCallbackQuery", callback_query_id=cb.get("id"), text=result)
+    if msg.get("message_id") and action != "remove":
+        _tg(cfg, "editMessageText", chat_id=cfg.telegram_chat,
+            message_id=msg["message_id"], text=result)
+    else:
+        _tg(cfg, "sendMessage", chat_id=cfg.telegram_chat, text=result)
+
+
+def poll_access_requests(cfg: Config) -> None:
+    """Read new Telegram updates (cheap; the loop calls this every minute)."""
+    if not cfg.telegram_token or not cfg.telegram_chat:
+        return
+    state = load_state(cfg.state_file)
+    updates = _tg(cfg, "getUpdates", offset=int(state.get("tg_offset") or 0),
+                  timeout=0, allowed_updates=["message", "callback_query"])
+    if not updates:
+        return
+    for upd in updates:
+        state["tg_offset"] = max(int(state.get("tg_offset") or 0),
+                                 int(upd.get("update_id", 0)) + 1)
+        try:
+            if upd.get("callback_query"):
+                _handle_callback(cfg, state, upd["callback_query"])
+            elif upd.get("message"):
+                _handle_message(cfg, state, upd["message"])
+        except Exception:  # noqa: BLE001 - one odd update must not block the rest
+            log.exception("Could not handle Telegram update %s", upd.get("update_id"))
+    cfg.subscribers = list(state["subscribers"])
+    save_state(cfg.state_file, state)
+    set_output("state_changed", "true")
 
 
 def run_test(cfg: Config) -> int:
@@ -1683,7 +1826,12 @@ def _process_source(cfg: Config, src: "Source", state: dict,
 
 
 def run_normal(cfg: Config) -> int:
+    try:
+        poll_access_requests(cfg)  # /start requests, owner's Allow/Deny taps
+    except Exception:  # noqa: BLE001 - never let Telegram I/O stop a check
+        log.exception("Access-request polling failed.")
     state = load_state(cfg.state_file)
+    cfg.subscribers = list(state["subscribers"])
     now_lisbon = datetime.now(LISBON)
     act, _is_night = should_act(now_lisbon, state)
     if not act:
@@ -1785,12 +1933,13 @@ def _maybe_alert_failure(cfg: Config, src: "Source", n: int, err: Exception) -> 
     if n == FAILURE_ALERT_THRESHOLD or (
         n > FAILURE_ALERT_THRESHOLD and n % FAILURE_REALERT_EVERY == 0
     ):
-        telegram_send(
+        telegram_send(  # technical alert: owner only
             cfg,
             f"⚠️ <b>Ticket monitor</b> — {_esc(src.name)}\n"
             f"Could not read the site {n} checks in a row"
             f"{' (it is blocking GitHub servers; the bot keeps switching servers)' if isinstance(err, SiteBlockedError) else ''}.\n"
             f"<code>{_esc(str(err))[:300]}</code>",
+            chats=[cfg.telegram_chat],
         )
 
 
