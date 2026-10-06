@@ -682,6 +682,60 @@ def drop_past(events: list[Event], now: datetime | None = None) -> list[Event]:
     return sorted(kept, key=lambda e: e.start or far)
 
 
+FPF_BUY_URL = "https://bilheteira.fpf.pt/checkout/{code}"
+# Youth / women's / futsal / beach national teams (Tags like "CZE,POR,SUB21",
+# competitions like "CAMP. EUROPA S21 ..."): not the senior men's team.
+_FPF_NOT_A_TEAM_TAG = re.compile(r"^(SUB\d*|U\d+|FEM\w*|FUTSAL|PRAIA|BEACH)$", re.I)
+_FPF_NOT_A_TEAM_COMP = re.compile(r"\bS\d{2}\b|\bsub[- ]?\d{2}|\bU\d{2}\b|femin|futsal|praia",
+                                  re.I)
+
+
+def parse_fpf_odata(data, src: "Source") -> list[Event]:
+    """Parse score2-external-api.fpf.pt .../odata/Events (new FPF site, 2026-10).
+
+    Senior men's national team matches only. Status: IsSoldOut, then the
+    sale window (SaleStartDate / SaleEndDate, UTC).
+    """
+    items = data.get("value") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        raise RuntimeError("unexpected FPF response (no 'value' list)")
+    now = _now_utc()
+    events: list[Event] = []
+    for it in items:
+        if not isinstance(it, dict) or str(it.get("Type") or "Match") != "Match":
+            continue
+        tags = [t.strip() for t in str(it.get("Tags") or "").split(",") if t.strip()]
+        comp = _norm_ws(str(it.get("CompetitionName") or ""))
+        if any(_FPF_NOT_A_TEAM_TAG.match(t) for t in tags) or _FPF_NOT_A_TEAM_COMP.search(comp):
+            continue
+        home = _norm_ws(str(it.get("HomeTeamName") or ""))
+        away = _norm_ws(str(it.get("AwayTeamName") or ""))
+        title = " x ".join(t for t in (home, away) if t) or _norm_ws(str(it.get("Name") or ""))
+        sale_start = _parse_start(it.get("SaleStartDate"))
+        sale_end = _parse_start(it.get("SaleEndDate"))
+        note = ""
+        if it.get("IsSoldOut"):
+            status = "SOLD_OUT"
+        elif sale_start and now < sale_start:
+            status = "SOON"
+            note = "sale opens " + sale_start.astimezone(LISBON).strftime("%d.%m %H:%M")
+        elif sale_end and now > sale_end:
+            status, note = "SOLD_OUT", "online sale closed"
+        else:
+            status = "AVAILABLE"
+        phase = _norm_ws(str(it.get("CompetitionPhase") or ""))
+        extra = " · ".join(x for x in (comp, phase, note) if x)
+        start = _parse_start(it.get("StartDate"))
+        code = str(it.get("Code") or "").strip()
+        events.append(Event(code or _event_id("", f"{title}-{it.get('StartDate')}"),
+                            title,
+                            FPF_BUY_URL.format(code=code) if code else src.url,
+                            start.astimezone(LISBON).strftime("%d.%m %H:%M") if start else None,
+                            status, _norm_ws(f"{title} {comp} {' '.join(tags)}"),
+                            extra=extra, start=start))
+    return events
+
+
 SPORTING_BUY_URL = "https://tickets.sporting.pt/pt/evento/{token}"
 SPORTING_GAME_API = ("https://tickets.sporting.pt/api/match/opengames"
                      "?gamecode={token}&queueItToken=null")
@@ -1072,6 +1126,8 @@ def parse_source_json(data, src: "Source") -> list[Event]:
         return parse_sporting_api(data, src, details=fetch_sporting_details(data))
     if src.parser == "fcporto":
         return parse_fcporto(data, src)
+    if src.parser == "fpf_odata":
+        return parse_fpf_odata(data, src)
     return parse_json_events(data, src)
 
 

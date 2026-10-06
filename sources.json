@@ -5,12 +5,10 @@
     "emoji": "🇵🇹",
     "url": "https://bilheteira.fpf.pt/",
     "api_type": "json",
-    "api_url": "https://bilheteira.fpf.pt/public/Event",
-    "keywords": [
-      "portugal"
-    ],
+    "api_url": "https://score2-external-api.fpf.pt/api/ticketing-fo/odata/Events",
+    "keywords": [],
     "exclude_keywords": [],
-    "event_url": "https://bilheteira.fpf.pt/checkOut/{id}"
+    "parser": "fpf_odata"
   },
   {
     "id": "sporting",

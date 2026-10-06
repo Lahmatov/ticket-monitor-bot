@@ -122,8 +122,11 @@ FPF — все матчи сборной по слову `portugal`; для Spor
 | `html` | обычный GET + эвристический парс HTML | — (по умолчанию) |
 
 Все сайты читаются без браузера:
-- **FPF** — `https://bilheteira.fpf.pt/public/Event` (общий JSON-разбор;
-  `isSoldOut` = распродано).
+- **FPF** — новый сайт (с 10.2026): OData
+  `https://score2-external-api.fpf.pt/api/ticketing-fo/odata/Events`,
+  `parser: "fpf_odata"`: только основная мужская сборная (теги `SUB21`,
+  `FEM`, `FUTSAL`… и турниры «S21»/«Sub-…» отсеиваются); статус из `IsSoldOut`
+  и окна продаж `SaleStartDate`/`SaleEndDate`.
 - **Sporting** — `https://tickets.sporting.pt/api/match/allopengames`,
   `parser: "sporting_api"`: все открытые игры, только `modality = Futebol`;
   статус из `soldOut` / `allowSale` **и** `disabledReasonDesc` (надпись на
@@ -141,7 +144,7 @@ FPF — все матчи сборной по слову `portugal`; для Spor
 Ссылки ведут сразу в покупку конкретного матча: Sporting —
 `tickets.sporting.pt/pt/evento/<token>`, Benfica — ссылка «Bilhetes» с карточки,
 Porto — `bilhetes.fcporto.pt/jogos/<id>/comprar`, FPF —
-`bilheteira.fpf.pt/checkOut/<eventID>` (шаблон `event_url` в `sources.json`).
+`bilheteira.fpf.pt/checkout/<Code>`.
 В сводке название матча — кликабельная ссылка.
 
 Статус Sporting берётся со страницы самого матча
