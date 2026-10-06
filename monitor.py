@@ -281,7 +281,11 @@ class Config:
     def __init__(self) -> None:
         self.state_file = os.environ.get("STATE_FILE", "state.json").strip()
         self.telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-        self.telegram_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        # One or more recipients: "123" or "123,456" (owner first).
+        self.telegram_chats = [c for c in re.split(r"[\s,;]+",
+                                                   os.environ.get("TELEGRAM_CHAT_ID", ""))
+                               if c]
+        self.telegram_chat = self.telegram_chats[0] if self.telegram_chats else ""
         # Send a summary of every check (even when nothing is on sale).
         self.report_every_run = os.environ.get("REPORT_EVERY_RUN", "").strip().lower() \
             in ("1", "true", "yes", "on")
@@ -1174,13 +1178,24 @@ def matches_keywords(event: Event, src: "Source") -> bool:
 # --------------------------------------------------------------------------- #
 
 
-def telegram_send(cfg: Config, text: str, preview: bool = True) -> bool:
-    if not cfg.telegram_token or not cfg.telegram_chat:
+def telegram_send(cfg: Config, text: str, preview: bool = True,
+                  chats: list[str] | None = None) -> bool:
+    """Send to every recipient (default: all TELEGRAM_CHAT_ID entries).
+
+    True if at least one recipient got it, so one blocked/removed recipient
+    can't make the owner's alerts repeat forever.
+    """
+    chats = chats if chats is not None else cfg.telegram_chats
+    if not cfg.telegram_token or not chats:
         log.error("Telegram token/chat id not configured; cannot send message.")
         return False
+    return any([_telegram_send_one(cfg, chat, text, preview) for chat in chats])
+
+
+def _telegram_send_one(cfg: Config, chat: str, text: str, preview: bool) -> bool:
     api = f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage"
     payload = {
-        "chat_id": cfg.telegram_chat,
+        "chat_id": chat,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": not preview,
@@ -1190,6 +1205,11 @@ def telegram_send(cfg: Config, text: str, preview: bool = True) -> bool:
             resp = requests.post(api, data=payload, timeout=REQUEST_TIMEOUT)
             if resp.status_code == 200:
                 return True
+            # Recipient blocked the bot / never pressed Start: retrying won't help.
+            if resp.status_code in (400, 403):
+                log.warning("Telegram: chat ...%s rejected the message (%s): %s",
+                            str(chat)[-3:], resp.status_code, resp.text[:200])
+                return False
             log.warning("Telegram send failed (%s): %s", resp.status_code, resp.text[:300])
         except requests.RequestException as err:
             log.warning("Telegram send error attempt %d: %s", attempt, err)
@@ -1501,9 +1521,27 @@ def run_chatid(cfg: Config) -> int:
         print("No chats found. Send a message to the bot in Telegram first, "
               "then run this again.")
         return 1
-    print("Chats found (set TELEGRAM_CHAT_ID to the id you want):")
+    # The repo (and so this log) is public: never print full ids or names
+    # here. If an owner chat is configured, send the full list there instead.
+    print(f"Chats found: {len(seen)}")
     for cid, name in seen.items():
-        print(f"  chat_id = {cid}   ({name})")
+        known = " (already a recipient)" if cid in cfg.telegram_chats else ""
+        print(f"  chat_id = ...{cid[-3:]}{known}")
+    if cfg.telegram_chat:
+        lines = ["👥 <b>Who has written to the bot</b>", ""]
+        for cid, name in seen.items():
+            mark = " ✅ already gets messages" if cid in cfg.telegram_chats else ""
+            lines.append(f"• {_esc(name)} — <code>{cid}</code>{mark}")
+        lines += ["", "To add someone: GitHub → repo Settings → Secrets and variables → "
+                      "Actions → <b>TELEGRAM_CHAT_ID</b> → Update, and list the ids "
+                      "separated by commas, yours first (e.g. <code>"
+                      f"{_esc(cfg.telegram_chat)},123456789</code>)."]
+        ok = telegram_send(cfg, "\n".join(lines), preview=False,
+                           chats=[cfg.telegram_chat])
+        print("Full list sent to the owner's Telegram." if ok
+              else "Could not send the list to Telegram.")
+    else:
+        print("Set TELEGRAM_CHAT_ID (your own id) to receive the full list in Telegram.")
     return 0
 
 
