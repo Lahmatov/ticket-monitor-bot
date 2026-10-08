@@ -725,11 +725,20 @@ def _fmt_sale_opens(dt: datetime) -> str:
     return f"sale opens {d.strftime('%a')} {d.day} {d.strftime('%b')}, {d.strftime('%H:%M')}"
 
 
+# EventSalesStatusEnum on the FPF site (may arrive as name or number).
+_FPF_SALES_STATUS = {"onsale": "OnSale", "1": "OnSale",
+                     "comingsoon": "ComingSoon", "2": "ComingSoon",
+                     "closed": "Closed", "3": "Closed"}
+
+
 def parse_fpf_odata(data, src: "Source") -> list[Event]:
     """Parse score2-external-api.fpf.pt .../odata/Events (new FPF site, 2026-10).
 
-    Senior men's national team matches only. Status: IsSoldOut, then the
-    sale window (SaleStartDate / SaleEndDate, UTC).
+    Senior men's national team matches only. Status mirrors the site's own
+    canBuyTicket(): SalesStatus OnSale and not IsSoldOut -> on sale;
+    ComingSoon -> soon ("To be announced soon"); Closed -> sale closed.
+    Older responses carried a sale window (SaleStartDate/SaleEndDate)
+    instead; without either signal the status is UNKNOWN, never "on sale".
     """
     items = data.get("value") if isinstance(data, dict) else data
     if not isinstance(items, list):
@@ -748,16 +757,31 @@ def parse_fpf_odata(data, src: "Source") -> list[Event]:
         title = " x ".join(t for t in (home, away) if t) or _norm_ws(str(it.get("Name") or ""))
         sale_start = _parse_start(it.get("SaleStartDate"))
         sale_end = _parse_start(it.get("SaleEndDate"))
+        sales = _FPF_SALES_STATUS.get(str(it.get("SalesStatus") or "").strip().lower())
         note = ""
-        if it.get("IsSoldOut"):
+        if sales == "ComingSoon":
+            status = "SOON"
+            if sale_start and now < sale_start:
+                note = _fmt_sale_opens(sale_start)
+        elif sales == "Closed":
+            status, note = "SOLD_OUT", "online sale closed"
+        elif sales == "OnSale":
+            status = "SOLD_OUT" if it.get("IsSoldOut") else "AVAILABLE"
+        elif it.get("SalesStatus") not in (None, ""):
+            status = "UNKNOWN"
+            note = f"site status: {it.get('SalesStatus')}"
+        # Legacy shape: no SalesStatus, a sale window instead.
+        elif it.get("IsSoldOut"):
             status = "SOLD_OUT"
         elif sale_start and now < sale_start:
             status = "SOON"
             note = _fmt_sale_opens(sale_start)
         elif sale_end and now > sale_end:
             status, note = "SOLD_OUT", "online sale closed"
-        else:
+        elif sale_start:
             status = "AVAILABLE"
+        else:
+            status, note = "UNKNOWN", "no sale info from FPF"
         phase = _norm_ws(str(it.get("CompetitionPhase") or ""))
         extra = " · ".join(x for x in (comp, phase, note) if x)
         start = _parse_start(it.get("StartDate"))
