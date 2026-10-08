@@ -786,7 +786,11 @@ def parse_fpf_odata(data, src: "Source") -> list[Event]:
         extra = " · ".join(x for x in (comp, phase, note) if x)
         start = _parse_start(it.get("StartDate"))
         code = str(it.get("Code") or "").strip()
-        events.append(Event(code or _event_id("", f"{title}-{it.get('StartDate')}"),
+        # FPF's Code is not stable (a new GUID shows up between requests), so
+        # identify the match by its teams and kick-off; Code only builds the link.
+        stable = (f"{it.get('HomeTeamCode3') or home}-{it.get('AwayTeamCode3') or away}"
+                  f"-{str(it.get('StartDate') or '')[:16]}").lower()
+        events.append(Event(stable,
                             title,
                             FPF_BUY_URL.format(code=code) if code else src.url,
                             start.astimezone(LISBON).strftime("%d.%m %H:%M") if start else None,
