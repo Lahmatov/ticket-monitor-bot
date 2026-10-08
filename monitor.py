@@ -395,9 +395,11 @@ def fetch(url: str, accept: str = "text/html,application/xhtml+xml",
 
 
 class Event:
-    __slots__ = ("id", "title", "url", "date", "status", "context", "extra", "start")
+    __slots__ = ("id", "title", "url", "date", "status", "context", "extra", "start",
+                 "venue")
 
-    def __init__(self, id_, title, url, date, status, context, extra="", start=None):
+    def __init__(self, id_, title, url, date, status, context, extra="", start=None,
+                 venue=""):
         self.id = id_
         self.title = title
         self.url = url
@@ -406,6 +408,7 @@ class Event:
         self.context = context
         self.extra = extra  # optional secondary line (competition, time, …)
         self.start = start  # aware datetime of kick-off, if known
+        self.venue = venue or ""  # stadium, if the site says
 
     def __repr__(self) -> str:
         return f"<Event {self.status} {self.title!r} {self.date} {self.url}>"
@@ -795,7 +798,8 @@ def parse_fpf_odata(data, src: "Source") -> list[Event]:
                             FPF_BUY_URL.format(code=code) if code else src.url,
                             start.astimezone(LISBON).strftime("%d.%m %H:%M") if start else None,
                             status, _norm_ws(f"{title} {comp} {' '.join(tags)}"),
-                            extra=extra, start=start))
+                            extra=extra, start=start,
+                            venue=_norm_ws(str(it.get("Location") or ""))))
     return events
 
 
@@ -881,6 +885,21 @@ def _sporting_status(g: dict, detail: dict | None) -> tuple[str, str]:
     return ("AVAILABLE", "") if g.get("allowSale") else ("SOON", "")
 
 
+# tickets.sporting.pt only exposes a venueId; the site itself just says
+# "Jogo Fora" for away games, so only Alvalade can be named.
+_SPORTING_VENUES = {1: "Estádio José Alvalade, Lisboa"}
+
+
+def _sporting_venue(g: dict) -> str:
+    home = str((g.get("homeTeam") or {}).get("name") or "").upper()
+    if "SPORTING" not in home:
+        return "away game"
+    try:
+        return _SPORTING_VENUES.get(int(g.get("venueId")), "")
+    except (TypeError, ValueError):
+        return ""
+
+
 def parse_sporting_api(data, src: "Source", details: dict | None = None) -> list[Event]:
     """Parse tickets.sporting.pt allopengames JSON (+ per-game page data)."""
     details = details or {}
@@ -899,9 +918,11 @@ def parse_sporting_api(data, src: "Source", details: dict | None = None) -> list
         when = _fmt_iso_datetime(str(g.get("date", "")))
         eid = str(g.get("id") or _event_id("", f"{title}-{g.get('date','')}"))
         url = SPORTING_BUY_URL.format(token=token) if token else (src.browse_url or src.url)
+        venue = _sporting_venue(g)
         context = _norm_ws(f"{title} {comp} {g.get('modality','')}")
         events.append(Event(eid, title, url, when or None, status, context,
-                            extra=comp, start=_parse_start(g.get("date"))))
+                            extra=comp, start=_parse_start(g.get("date")),
+                            venue=venue))
     return events
 
 
@@ -919,6 +940,7 @@ query getHomeMatches($pageSize: Int!, $matchDate: DateFilter!, $sport: SportId) 
       localStartsAt
       localSaleStartsAt
       status
+      venue { name }
     }
   }
 }
@@ -988,7 +1010,8 @@ def parse_fcporto(data, src: "Source") -> list[Event]:
             events.append(Event(eid, title, f"https://bilhetes.fcporto.pt/jogos/{eid}/comprar",
                                 start.astimezone(LISBON).strftime("%d.%m %H:%M") if start else None,
                                 status, _norm_ws(f"{title} {comp} {raw}"),
-                                extra=" · ".join(notes), start=start))
+                                extra=" · ".join(notes), start=start,
+                                venue=_norm_ws(str((g.get("venue") or {}).get("name") or ""))))
     return events
 
 
@@ -1066,6 +1089,8 @@ def parse_benfica(html: str, src: "Source") -> list[Event]:
         title = " x ".join(t for t in teams if t) or "SL Benfica"
         comp = _norm_ws(card.select_one(".type-liga").get_text(" ")) \
             if card.select_one(".type-liga") else ""
+        venue_el = card.select_one(".game_bar h6")
+        venue = _norm_ws(venue_el.get_text(" ")) if venue_el else ""
         when_el = card.select_one(".game_bar h5")
         when_txt = _norm_ws(when_el.get_text(" ")) if when_el else ""
         start = _parse_pt_datetime(when_txt)
@@ -1091,7 +1116,7 @@ def parse_benfica(html: str, src: "Source") -> list[Event]:
         events.append(Event(eid, title, url,
                             start.strftime("%d.%m %H:%M") if start else (when_txt or None),
                             status, _norm_ws(f"{title} {comp} {badge}"), extra=extra,
-                            start=start))
+                            start=start, venue=venue))
     return events
 
 
@@ -1267,6 +1292,8 @@ def format_notification(event: Event, source_name: str) -> str:
         lines.append(f"\U0001F3C6 {_esc(event.extra)}")
     if event.date:
         lines.append(f"\U0001F4C5 {_esc(event.date)}")
+    if event.venue:
+        lines.append(f"\U0001F3DF {_esc(event.venue)}")
     if event.url:
         lines.append("")
         lines.append(f'\U0001F517 <a href="{_esc(event.url)}">Buy tickets</a>')
@@ -1361,7 +1388,8 @@ def run_diagnostic(cfg: Config, dump_file: str | None) -> int:
             star = "  <-- keyword match" if matches_keywords(ev, src) else ""
             if ev not in upcoming:
                 star = "  (already played -> hidden)"
-            print(f"[{ev.status:9}] {ev.title[:70]!r} | {ev.date} | {ev.extra} | {ev.url}{star}")
+            print(f"[{ev.status:9}] {ev.title[:70]!r} | {ev.date} | {ev.extra} | "
+                  f"{ev.venue or '-'} | {ev.url}{star}")
         matched = [e for e in upcoming if matches_keywords(e, src)]
         kw = src.keywords or "(all events)"
         print(f"\nKeywords {kw}: {len(matched)} match; "
@@ -1791,9 +1819,16 @@ def _summary_block(src: "Source", matched: list) -> str:
         if ev.url:  # tap the match to open its ticket page
             name = f'<a href="{_esc(ev.url)}">{name}</a>'
         lines.append(f"{dot} {when}{name}")
-        if ev.extra:
-            lines.append(f"      <i>{_esc(ev.extra)}</i>")
+        details = _event_details(ev)
+        if details:
+            lines.append(f"      <i>{_esc(details)}</i>")
     return "\n".join(lines)
+
+
+def _event_details(ev) -> str:
+    """Second line under a match: competition / notes · 🏟 stadium."""
+    venue = f"🏟 {ev.venue}" if getattr(ev, "venue", "") else ""
+    return " · ".join(x for x in (ev.extra, venue) if x)
 
 
 def _totals_line(statuses: list[str]) -> str:
@@ -1948,8 +1983,9 @@ def _event_line(ev, prefix: str) -> list[str]:
     when = f"<b>{_esc(ev.date)}</b>  " if ev.date else ""
     name = f'<a href="{_esc(ev.url)}">{_esc(ev.title)}</a>' if ev.url else _esc(ev.title)
     lines = [f"{prefix} {when}{name}"]
-    if ev.extra:
-        lines.append(f"      <i>{_esc(ev.extra)}</i>")
+    details = _event_details(ev)
+    if details:
+        lines.append(f"      <i>{_esc(details)}</i>")
     return lines
 
 
