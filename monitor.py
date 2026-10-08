@@ -1485,6 +1485,16 @@ def run_probe(cfg: Config) -> int:
     """
     direct = os.environ.get("PROBE_URL", "").strip()
     grep = os.environ.get("PROBE_GREP", "").strip()
+    post = os.environ.get("PROBE_POST", "").strip()
+    if direct and post:  # POST a JSON body (e.g. a GraphQL query) and dump the reply
+        print(f"\n=== POST {direct} ===")
+        try:
+            body = fetch(direct, accept="application/json", json_body=json.loads(post),
+                         extra_headers={"Origin": f"https://{urlparse(direct).netloc}"})
+        except Exception as err:  # noqa: BLE001
+            body = f"request error: {err}"
+        print(_norm_ws(body)[:4000])
+        return 0
     if direct:
         for u in direct.split(","):
             u = u.strip()

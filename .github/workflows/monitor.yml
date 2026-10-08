@@ -25,6 +25,10 @@ on:
         description: "In probe mode: if set, download probe_url and grep for this term"
         type: string
         default: ""
+      probe_post:
+        description: "In probe mode: JSON body to POST to probe_url (e.g. GraphQL)"
+        type: string
+        default: ""
 
 # One monitor loop at a time; a loop run triggered while one is active waits
 # its turn. One-off modes (diagnostic/test/probe/chatid) run immediately.
@@ -76,6 +80,7 @@ jobs:
           REPORT_MODE: "changes"
           PROBE_URL: ${{ inputs.probe_url }}
           PROBE_GREP: ${{ inputs.probe_grep }}
+          PROBE_POST: ${{ inputs.probe_post }}
         run: |
           if [ "$IS_LOOP" = "true" ]; then
             python monitor.py --mode normal --loop-minutes "$LOOP_MINUTES"
