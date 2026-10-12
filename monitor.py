@@ -870,12 +870,9 @@ def _sporting_status(g: dict, detail: dict | None) -> tuple[str, str]:
         public = bool(detail.get("allowPublicTickets"))
         member = bool(detail.get("allowMemberTickets"))
         if detail.get("allowSale") and (public or member):
-            notes = []
-            if member and not public:
-                notes.append("members (sócios) only")
-            if detail.get("queueItRedirectUrl"):
-                notes.append("virtual queue active")
-            return "AVAILABLE", " · ".join(notes)
+            note = "virtual queue active" if detail.get("queueItRedirectUrl") else ""
+            # Only sócios can buy: not something a non-member can act on.
+            return ("AVAILABLE" if public else "MEMBERS"), note
         return "SOON", ""
     # Fallback: listing only. Its disabledReasonDesc proved unreliable, so a
     # listed reason makes the status "unclear" rather than "not on sale".
@@ -884,7 +881,9 @@ def _sporting_status(g: dict, detail: dict | None) -> tuple[str, str]:
         return "SOLD_OUT", ""
     if reason:
         return "UNKNOWN", f"listing says: {reason}"
-    return ("AVAILABLE", "") if g.get("allowSale") else ("SOON", "")
+    if not g.get("allowSale"):
+        return "SOON", ""
+    return ("MEMBERS" if g.get("member") and not g.get("public") else "AVAILABLE"), ""
 
 
 # tickets.sporting.pt only exposes a venueId; the site itself just says
@@ -913,7 +912,9 @@ def parse_sporting_api(data, src: "Source", details: dict | None = None) -> list
         token = str(g.get("token") or "").strip()
         status, note = _sporting_status(g, details.get(token))
         notes = [_norm_ws(str(g.get("competition", "")))]
-        if g.get("member") and not g.get("public") and "members" not in note:
+        # The listing's member/public flags lag behind the game page: once the
+        # page says public tickets are on sale, don't call it members-only.
+        if g.get("member") and not g.get("public") and status not in ("MEMBERS", "AVAILABLE"):
             notes.append("members (sócios) only")
         notes.append(note)
         comp = " · ".join(n for n in notes if n)
@@ -942,6 +943,8 @@ query getHomeMatches($pageSize: Int!, $matchDate: DateFilter!, $sport: SportId) 
       localStartsAt
       localSaleStartsAt
       status
+      allowPublicPurchase
+      onlineSale
       venue { name }
     }
   }
@@ -957,6 +960,7 @@ _FCPORTO_STATUS = {
     "SOON": "SOON", "COMING_SOON": "SOON", "NOT_STARTED": "SOON",
     "SCHEDULED": "SOON", "UPCOMING": "SOON", "PRE_SALE": "SOON",
     "CLOSED": "SOLD_OUT", "SALE_CLOSED": "SOLD_OUT", "ENDED": "SOLD_OUT",
+    "FINISHED": "SOLD_OUT",  # MatchStatus enum: FINISHED, OPEN, SCHEDULED, SOLD_OUT
 }
 
 
@@ -998,6 +1002,10 @@ def parse_fcporto(data, src: "Source") -> list[Event]:
             sale_start = _parse_start(g.get("localSaleStartsAt"))
             if status == "AVAILABLE" and sale_start and sale_start > now:
                 status = "SOON"
+            if status == "AVAILABLE" and g.get("onlineSale") is False:
+                status = "UNKNOWN"  # open, but not sold online
+            elif status == "AVAILABLE" and g.get("allowPublicPurchase") is False:
+                status = "MEMBERS"
             comp = _norm_ws(" · ".join(
                 x for x in (str((g.get("competition") or {}).get("name") or ""),
                             str(g.get("competitionPhase") or "")) if x))
@@ -1005,7 +1013,8 @@ def parse_fcporto(data, src: "Source") -> list[Event]:
             if status == "SOON" and sale_start and sale_start > now:
                 notes.append(_fmt_sale_opens(sale_start))
             if status == "UNKNOWN":
-                notes.append(f"site status: {raw or '?'}")
+                notes.append("not sold online (box office only?)" if raw == "OPEN"
+                             else f"site status: {raw or '?'}")
             start = _parse_start(g.get("localStartsAt"))
             eid = str(g.get("id") or _event_id("", f"{title}-{g.get('localStartsAt')}"))
             # "/comprar" is the purchase flow behind the match page's buy button.
@@ -1054,7 +1063,7 @@ _BENFICA_BADGES = (
     ("esgotado", "SOLD_OUT", ""),
     ("mercado secund", "RESALE", ""),
     ("por iniciar", "SOON", ""),
-    ("exclusivo", "AVAILABLE", None),  # None -> use the badge text as the note
+    ("exclusivo", "MEMBERS", None),  # None -> use the badge text as the note
 )
 _BENFICA_BADGE_EN = {
     "exclusivo a sócios e adeptos registados": "members & registered fans only",
@@ -1813,6 +1822,7 @@ def run_test(cfg: Config) -> int:
 
 _STATUS_LABEL = {
     "AVAILABLE": "🟢 on sale",
+    "MEMBERS": "🔵 on sale to club members only",
     "SOLD_OUT": "🔴 sold out",
     "SOON": "🟡 not on sale yet",
     "RESALE": "🟠 resale only (official secondary market)",
@@ -1821,9 +1831,10 @@ _STATUS_LABEL = {
 
 
 # Order and wording of the per-check legend / totals line.
-_STATUS_ORDER = ("AVAILABLE", "RESALE", "SOON", "SOLD_OUT", "UNKNOWN")
+_STATUS_ORDER = ("AVAILABLE", "MEMBERS", "RESALE", "SOON", "SOLD_OUT", "UNKNOWN")
 _STATUS_DOT = {s: _STATUS_LABEL[s].split(" ", 1)[0] for s in _STATUS_ORDER}
-_STATUS_SHORT = {"AVAILABLE": "on sale", "RESALE": "resale only", "SOON": "soon",
+_STATUS_SHORT = {"AVAILABLE": "on sale", "MEMBERS": "members only",
+                 "RESALE": "resale only", "SOON": "soon",
                  "SOLD_OUT": "sold out", "UNKNOWN": "unclear"}
 
 
