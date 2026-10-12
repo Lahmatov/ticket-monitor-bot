@@ -379,7 +379,9 @@ def fetch(url: str, accept: str = "text/html,application/xhtml+xml",
             else:
                 resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
-            return resp.text
+            if "charset" not in resp.headers.get("content-type", "").lower():
+                resp.encoding = "utf-8"  # requests would assume ISO-8859-1
+            return resp.text.lstrip("\ufeff")  # some sites prepend a UTF-8 BOM
         except requests.RequestException as err:  # noqa: PERF203
             last_err = err
             wait = REQUEST_BACKOFF ** attempt
@@ -1176,11 +1178,37 @@ def _load_events_raw(src: "Source") -> list[Event]:
             return parse_sporting_dom(html, src)
         return parse_events(html, src.browse_url, src)
     page = fetch(src.url)
+    check_unavailable(page)
     return parse_html_source(page, src)
 
 
 class SiteBlockedError(RuntimeError):
     """The site answered with an anti-bot / IP-ban page instead of data."""
+
+
+class SiteMaintenanceError(RuntimeError):
+    """The site shows a "back soon" / maintenance page instead of data."""
+
+
+# Seen on tickets.sporting.pt (whole site + API): <title>Voltamos em breve!</title>
+_MAINTENANCE_MARKERS = ("voltamos em breve", "voltaremos em breve", "em manutenção",
+                        "em manutencao", "site em manutenção", "under maintenance",
+                        "maintenance mode", "be right back", "we'll be back soon",
+                        "we will be back soon", "volvemos pronto")
+
+
+def check_unavailable(raw: str) -> None:
+    """Raise SiteMaintenanceError / SiteBlockedError if raw is such a page."""
+    if not raw or raw.lstrip()[:1] in ("{", "["):
+        return  # JSON: real data
+    soup = BeautifulSoup(raw, "html.parser")
+    title = _norm_ws(soup.title.get_text(" ")) if soup.title else ""
+    text = _norm_ws(soup.get_text(" "))[:3000]
+    head = f"{title} {text[:400]}".lower()
+    if any(m in head for m in _MAINTENANCE_MARKERS):
+        raise SiteMaintenanceError(f"site is down for maintenance: {(title or text)[:80]}")
+    if any(m in text.lower() for m in _BLOCK_MARKERS):
+        raise SiteBlockedError(f"site blocked this server's IP: {text[:120]}")
 
 
 _BLOCK_MARKERS = ("ip address has been banned", "access denied", "you have been blocked",
@@ -1193,11 +1221,8 @@ def loads_json(raw: str, src: "Source"):
     try:
         return json.loads(raw)
     except ValueError:
+        check_unavailable(raw)
         text = _norm_ws(BeautifulSoup(raw or "", "html.parser").get_text(" "))
-        low = (text or raw or "").lower()
-        if any(m in low for m in _BLOCK_MARKERS):
-            raise SiteBlockedError(
-                f"site blocked this server's IP: {text[:120]}") from None
         raise RuntimeError(
             f"expected JSON, got {('empty response' if not (raw or '').strip() else repr(text[:120]))}"
         ) from None
@@ -1878,17 +1903,34 @@ def _process_source(cfg: Config, src: "Source", state: dict,
     except Exception as err:  # noqa: BLE001 - handle any failure uniformly
         log.error("[%s] fetch/parse failed: %s", src.id, err)
         failures[src.id] = failures.get(src.id, 0) + 1
-        state.setdefault("blocked", {})[src.id] = isinstance(err, SiteBlockedError)
-        _maybe_alert_failure(cfg, src, failures[src.id], err)
-        why = ("the site blocked this GitHub server's IP — switching to another "
-               "server automatically" if isinstance(err, SiteBlockedError)
-               else _esc(str(err)[:100]))
-        return True, (f"{_source_heading(src)}\n⚠️ could not read the site "
-                      f"<i>({why})</i>"), [], None
+        kind = ("maintenance" if isinstance(err, SiteMaintenanceError)
+                else "ban" if isinstance(err, SiteBlockedError) else "error")
+        kinds = state.setdefault("fail_kind", {})
+        if kind == "maintenance" and kinds.get(src.id) != "maintenance":
+            telegram_send(  # owner only, once per maintenance window
+                cfg, f"🛠 <b>{_esc(src.name)}</b>: the ticket site is down for "
+                     f"maintenance (<i>{_esc(str(err).split(': ', 1)[-1])}</i>). "
+                     "The bot keeps checking and will tell you when it's back - "
+                     "sites often do this right before a big sale.",
+                chats=[cfg.telegram_chat])
+        kinds[src.id] = kind
+        if kind != "maintenance":
+            _maybe_alert_failure(cfg, src, failures[src.id], err)
+        if kind == "maintenance":
+            block = (f"{_source_heading(src)}\n🛠 site is down for maintenance - "
+                     "checking until it's back")
+        else:
+            why = ("the site blocked this GitHub server's IP — switching to another "
+                   "server automatically" if kind == "ban" else _esc(str(err)[:100]))
+            block = (f"{_source_heading(src)}\n⚠️ could not read the site "
+                     f"<i>({why})</i>")
+        return True, block, [], None
 
     if failures.get(src.id):
         failures[src.id] = 0
-        state.setdefault("blocked", {}).pop(src.id, None)
+        if state.setdefault("fail_kind", {}).pop(src.id, None) == "maintenance":
+            telegram_send(cfg, f"✅ <b>{_esc(src.name)}</b>: the ticket site is back "
+                               "online.", chats=[cfg.telegram_chat])
         dirty = True
 
     matched = [e for e in events if matches_keywords(e, src)]
@@ -2032,14 +2074,18 @@ def _should_rotate(state: dict, elapsed_min: float) -> str:
     Sites like FPF ban individual GitHub runner IPs; a loop run keeps one IP
     for hours, so it would stay blind. Ending the run early hands over to a
     fresh run (usually on another machine/IP). A detected ban rotates after
-    one failed check, other errors after two; never more often than every
+    one failed check, other errors after two, a maintenance page never (it
+    is down for everyone); never more often than every
     ROTATE_MIN_ELAPSED_MIN, so a real site outage can't cause a restart storm.
     """
     if elapsed_min < ROTATE_MIN_ELAPSED_MIN:
         return ""
-    blocked = state.get("blocked") or {}
+    kinds = state.get("fail_kind") or {}
     for sid, n in (state.get("failures") or {}).items():
-        if n >= (1 if blocked.get(sid) else 2):
+        kind = kinds.get(sid, "error")
+        if kind == "maintenance":
+            continue  # the site is down for everyone; a new IP won't help
+        if n >= (1 if kind == "ban" else 2):
             return sid
     return ""
 
