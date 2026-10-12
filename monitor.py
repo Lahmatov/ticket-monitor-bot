@@ -215,7 +215,8 @@ class Source:
     def __init__(self, id, name, url, keywords=None, exclude_keywords=None,
                  event_selector="", title_selector="", link_selector="",
                  api_url="", api_type="html", browse_url="",
-                 wait_selector="", wait_ms=0, parser="", emoji="", event_url=""):
+                 wait_selector="", wait_ms=0, parser="", emoji="", event_url="",
+                 member_alerts=False):
         self.id = str(id).strip()
         self.name = str(name).strip() or self.id
         self.url = str(url).strip()
@@ -238,6 +239,9 @@ class Source:
         # Per-event buy link template for generic JSON sources, e.g.
         # "https://bilheteira.fpf.pt/checkOut/{id}".
         self.event_url = (event_url or "").strip()
+        # The owner is a club member (sócio) here: members-only sales alert
+        # the owner too, not just public sales.
+        self.member_alerts = bool(member_alerts)
 
 
 def _sources_from_env() -> list[Source] | None:
@@ -1319,9 +1323,11 @@ def _esc(text: str) -> str:
     return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def format_notification(event: Event, source_name: str) -> str:
-    lines = [f"\U0001F3AB <b>Tickets on sale!</b> — {_esc(source_name)}",
-             "", f"<b>{_esc(event.title)}</b>"]
+def format_notification(event: Event, source_name: str,
+                        members: bool = False) -> str:
+    head = ("\U0001F535 <b>Members' sale open!</b>" if members
+            else "\U0001F3AB <b>Tickets on sale!</b>")
+    lines = [f"{head} — {_esc(source_name)}", "", f"<b>{_esc(event.title)}</b>"]
     if event.extra:
         lines.append(f"\U0001F3C6 {_esc(event.extra)}")
     if event.date:
@@ -1331,6 +1337,9 @@ def format_notification(event: Event, source_name: str) -> str:
     if event.url:
         lines.append("")
         lines.append(f'\U0001F517 <a href="{_esc(event.url)}">Buy tickets</a>')
+    if members:
+        lines += ["", "<i>Only club members (sócios) can buy right now. Everyone "
+                      "gets a separate alert when the public sale opens.</i>"]
     return "\n".join(lines)
 
 
@@ -1950,24 +1959,36 @@ def _process_source(cfg: Config, src: "Source", state: dict,
     for ev in matched:
         key = f"{src.id}:{ev.id}"
         entry = notified.get(key)
-        if ev.status == "AVAILABLE":
-            if entry is None:
-                if telegram_send(cfg, format_notification(ev, src.name)):
-                    log.info("[%s] notified: %s", src.id, ev.title)
-                    notified[key] = {
-                        "source": src.id,
-                        "title": ev.title,
-                        "url": ev.url,
-                        "first_notified": now_iso,
-                        "last_seen": now_iso,
-                    }
-                    dirty = True
-                else:
-                    log.error("[%s] notify failed for %s; retry next run.",
-                              src.id, ev.title)
-            else:
+        # "level" = the sale phase already alerted; entries from before
+        # members alerts existed have none and were public alerts.
+        level = (entry or {}).get("level", "AVAILABLE")
+        members = ev.status == "MEMBERS" and src.member_alerts
+        if ev.status == "AVAILABLE" or members:
+            if entry is not None and (members or level == "AVAILABLE"):
+                # Already alerted for this phase (or public sale fell back to
+                # members-only, which the owner already knows about).
                 entry["last_seen"] = now_iso
+                entry["level"] = ev.status
                 dirty = True
+                continue
+            # Members-only sales go to the owner alone - other recipients
+            # aren't necessarily club members.
+            chats = [cfg.telegram_chat] if members else None
+            if telegram_send(cfg, format_notification(ev, src.name, members),
+                             chats=chats):
+                log.info("[%s] notified (%s): %s", src.id, ev.status, ev.title)
+                notified[key] = {
+                    "source": src.id,
+                    "title": ev.title,
+                    "url": ev.url,
+                    "level": ev.status,
+                    "first_notified": now_iso,
+                    "last_seen": now_iso,
+                }
+                dirty = True
+            else:
+                log.error("[%s] notify failed for %s; retry next run.",
+                          src.id, ev.title)
         elif entry is not None:
             # Not buyable any more: forget it, so tickets coming back (returns,
             # a new sale phase) trigger a fresh alert.
