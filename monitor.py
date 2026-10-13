@@ -216,7 +216,7 @@ class Source:
                  event_selector="", title_selector="", link_selector="",
                  api_url="", api_type="html", browse_url="",
                  wait_selector="", wait_ms=0, parser="", emoji="", event_url="",
-                 member_alerts=False):
+                 member_alerts=False, club=False):
         self.id = str(id).strip()
         self.name = str(name).strip() or self.id
         self.url = str(url).strip()
@@ -242,6 +242,9 @@ class Source:
         # The owner is a club member (sócio) here: members-only sales alert
         # the owner too, not just public sales.
         self.member_alerts = bool(member_alerts)
+        # A club with members (sócios): offered in the onboarding's
+        # membership question.
+        self.club = bool(club)
 
 
 def _sources_from_env() -> list[Source] | None:
@@ -324,6 +327,8 @@ def load_state(path: str) -> dict:
     data.setdefault("subscribers", {})  # chat_id -> {name, since}: approved by owner
     data.setdefault("pending", {})  # chat_id -> {name, requested}: awaiting owner
     data.setdefault("blocked", {})  # chat_id -> {name, since}: removed by the owner
+    data.setdefault("prefs", {})  # chat_id -> {teams: [src ids], member: [src ids]}
+    data.setdefault("prefs_draft", {})  # chat_id -> same, while onboarding
     data.setdefault("tg_offset", 0)  # next Telegram update_id to read
     return data
 
@@ -1683,11 +1688,11 @@ def run_chatid(cfg: Config) -> int:
 # --------------------------------------------------------------------------- #
 
 
-def _tg(cfg: Config, method: str, **params):
+def _tg(cfg: Config, method: str, http_timeout: float = REQUEST_TIMEOUT, **params):
     """Call a Telegram Bot API method; return its "result" or None."""
     try:
         resp = requests.post(f"https://api.telegram.org/bot{cfg.telegram_token}/{method}",
-                             json=params, timeout=REQUEST_TIMEOUT)
+                             json=params, timeout=http_timeout)
         data = resp.json()
     except (requests.RequestException, ValueError) as err:
         log.warning("Telegram %s failed: %s", method, err)
@@ -1725,10 +1730,139 @@ def _subscribe(cfg: Config, state: dict, cid: str, name: str) -> None:
     state["subscribers"][cid] = {"name": name, "since": _now_utc().isoformat()}
     _tg(cfg, "sendMessage", chat_id=cid,
         text="✅ You're subscribed! You'll get a message as soon as tickets go on "
-             "sale or a match's status changes (Portugal, Sporting, Benfica, "
-             "Porto). Send /status any time for the full overview, /stop to "
-             "unsubscribe.")
+             "sale or a match's status changes. Send /status any time for the "
+             "overview, /settings to change your teams, /stop to unsubscribe.")
+    _start_onboarding(cfg, state, cid, fresh=True)
+
+
+# --------------------------------------------------------------------------- #
+# Per-user preferences: which teams to follow, where the user is a sócio      #
+# --------------------------------------------------------------------------- #
+
+
+def _all_chats(cfg: Config) -> list[str]:
+    return cfg.telegram_chats + [c for c in cfg.subscribers if c not in cfg.telegram_chats]
+
+
+def _prefs(cfg: Config, state: dict, cid: str) -> dict:
+    """The user's choices; defaults: every team, membership only for the
+    owner on sources marked member_alerts."""
+    p = (state.get("prefs") or {}).get(cid) or {}
+    ids = [src.id for src in cfg.sources]
+    teams = [i for i in ids if i in p["teams"]] if "teams" in p else ids
+    if "member" in p:
+        member = p["member"]
+    elif cid == cfg.telegram_chat:
+        member = [src.id for src in cfg.sources if src.member_alerts]
+    else:
+        member = []
+    return {"teams": teams, "member": [i for i in member if i in teams]}
+
+
+def _recipients(cfg: Config, state: dict, sid: str, members: bool = False) -> list[str]:
+    key = "member" if members else "teams"
+    return [c for c in _all_chats(cfg) if sid in _prefs(cfg, state, c)[key]]
+
+
+def _team_label(src: "Source") -> str:
+    return f"{src.emoji} {src.name}".strip()
+
+
+def _teams_keyboard(cfg: Config, sel: list[str]) -> dict:
+    rows = [[{"text": f"{'✅' if src.id in sel else '⬜️'} {_team_label(src)}",
+              "callback_data": f"t:{src.id}"}] for src in cfg.sources]
+    rows.append([{"text": "Next ➡️", "callback_data": "tnext"}])
+    return {"inline_keyboard": rows}
+
+
+def _members_keyboard(cfg: Config, teams: list[str], sel: list[str]) -> dict:
+    rows = [[{"text": f"{'✅' if src.id in sel else '⬜️'} {_team_label(src)}",
+              "callback_data": f"m:{src.id}"}]
+            for src in cfg.sources if src.club and src.id in teams]
+    rows.append([{"text": "Done ✔️", "callback_data": "mdone"}])
+    return {"inline_keyboard": rows}
+
+
+_TEAMS_Q = ("⚙️ <b>Which teams do you want alerts for?</b>\n"
+            "Tap to select, then press Next.")
+_MEMBERS_Q = ("🎟 <b>Are you a club member (sócio)?</b>\n"
+              "Clubs often sell to members first. Tick the clubs where you're a "
+              "member to be alerted about those sales too - or just press Done.")
+
+
+def _start_onboarding(cfg: Config, state: dict, cid: str, fresh: bool = False) -> None:
+    cur = {"teams": [], "member": []} if fresh else _prefs(cfg, state, cid)
+    state["prefs_draft"][cid] = cur
+    _tg(cfg, "sendMessage", chat_id=cid, parse_mode="HTML", text=_TEAMS_Q,
+        reply_markup=_teams_keyboard(cfg, cur["teams"]))
+
+
+def _finish_onboarding(cfg: Config, state: dict, cid: str, draft: dict,
+                       message_id) -> None:
+    state["prefs"][cid] = {"teams": draft["teams"], "member": draft["member"]}
+    state["prefs_draft"].pop(cid, None)
+    names = lambda ids: ", ".join(_team_label(src) for src in cfg.sources  # noqa: E731
+                                  if src.id in ids) or "none"
+    text = (f"✅ <b>All set!</b>\nFollowing: {_esc(names(draft['teams']))}\n"
+            f"Members' sale alerts: {_esc(names(draft['member']))}\n\n"
+            "Change this any time with /settings.")
+    if message_id:
+        _tg(cfg, "editMessageText", chat_id=cid, message_id=message_id,
+            parse_mode="HTML", text=text)
+    else:
+        _tg(cfg, "sendMessage", chat_id=cid, parse_mode="HTML", text=text)
     _send_status(cfg, state, cid)
+
+
+def _handle_prefs_callback(cfg: Config, state: dict, cb: dict) -> None:
+    """Taps on the onboarding / /settings keyboards (any recipient)."""
+    msg = cb.get("message") or {}
+    cid = str((msg.get("chat") or {}).get("id") or (cb.get("from") or {}).get("id"))
+    data = str(cb.get("data") or "")
+    answer = lambda t="": _tg(cfg, "answerCallbackQuery",  # noqa: E731
+                              callback_query_id=cb.get("id"), text=t)
+    if cid not in cfg.telegram_chats and cid not in state["subscribers"]:
+        answer("Send /start to subscribe first.")
+        return
+    draft = state["prefs_draft"].get(cid)
+    if draft is None:  # e.g. an old keyboard: continue from the saved choices
+        draft = state["prefs_draft"][cid] = _prefs(cfg, state, cid)
+    ids = {src.id for src in cfg.sources}
+    mid = msg.get("message_id")
+    action, _, sid = data.partition(":")
+    if action in ("t", "m") and sid in ids:
+        key = "teams" if action == "t" else "member"
+        sel = draft[key]
+        if sid in sel:
+            sel.remove(sid)
+        else:
+            sel.append(sid)
+        if key == "teams":
+            draft["member"] = [i for i in draft["member"] if i in sel]
+            markup = _teams_keyboard(cfg, sel)
+        else:
+            markup = _members_keyboard(cfg, draft["teams"], sel)
+        answer()
+        _tg(cfg, "editMessageReplyMarkup", chat_id=cid, message_id=mid,
+            reply_markup=markup)
+    elif data == "tnext":
+        if not draft["teams"]:
+            answer("Pick at least one team.")
+            return
+        answer()
+        clubs = [src for src in cfg.sources if src.club and src.id in draft["teams"]]
+        if not clubs:
+            draft["member"] = []
+            _finish_onboarding(cfg, state, cid, draft, mid)
+            return
+        _tg(cfg, "editMessageText", chat_id=cid, message_id=mid, parse_mode="HTML",
+            text=_MEMBERS_Q, reply_markup=_members_keyboard(cfg, draft["teams"],
+                                                            draft["member"]))
+    elif data == "mdone":
+        answer()
+        _finish_onboarding(cfg, state, cid, draft, mid)
+    else:
+        answer()
 
 
 def _list_for_owner(cfg: Config, state: dict) -> None:
@@ -1760,6 +1894,9 @@ def _handle_message(cfg: Config, state: dict, msg: dict) -> None:
     if text == "/status" and (cid in cfg.telegram_chats or cid in state["subscribers"]):
         _send_status(cfg, state, cid)
         return
+    if text == "/settings" and (cid in cfg.telegram_chats or cid in state["subscribers"]):
+        _start_onboarding(cfg, state, cid)
+        return
     if cid in cfg.telegram_chats:  # the owner (or a fixed recipient)
         if cid == cfg.telegram_chat and text in ("/list", "/subscribers"):
             _list_for_owner(cfg, state)
@@ -1768,6 +1905,8 @@ def _handle_message(cfg: Config, state: dict, msg: dict) -> None:
         say("Sorry, this bot isn't available for you.")
         return
     if text == "/stop":
+        state["prefs"].pop(cid, None)
+        state["prefs_draft"].pop(cid, None)
         if state["subscribers"].pop(cid, None) is not None:
             say("You're unsubscribed. Send /start to subscribe again.")
             _tg(cfg, "sendMessage", chat_id=cfg.telegram_chat,
@@ -1776,7 +1915,8 @@ def _handle_message(cfg: Config, state: dict, msg: dict) -> None:
         return
     if cid in state["subscribers"]:
         say("✅ You already receive the ticket updates. Send /status for the "
-            "current overview, /stop to unsubscribe.")
+            "current overview, /settings to change your teams, /stop to "
+            "unsubscribe.")
     elif cfg.open_access:
         if text.split(maxsplit=1)[:1] != ["/start"]:
             say("👋 Hi! This bot sends Portuguese football ticket alerts. "
@@ -1794,9 +1934,20 @@ def _handle_message(cfg: Config, state: dict, msg: dict) -> None:
         _ask_owner(cfg, cid, name)
 
 
+def _report_messages(cfg: Config, state: dict, teams: list[str]) -> list[str]:
+    """The latest check's overview, limited to `teams`."""
+    rep_ = state.get("last_report") or {}
+    blocks = rep_.get("blocks") or {}
+    if not blocks:
+        return []
+    sts = [st for sid in teams for st in (rep_.get("statuses") or {}).get(sid, [])]
+    header = f"🔎 <b>Ticket check</b> · {rep_.get('time', '')}\n{_totals_line(sts)}"
+    return _pack_messages(header, [blocks[sid] for sid in teams if sid in blocks])
+
+
 def _send_status(cfg: Config, state: dict, cid: str) -> None:
-    """Reply with the summary of the latest check."""
-    summary = state.get("last_summary") or []
+    """Reply with the summary of the latest check (the user's teams only)."""
+    summary = _report_messages(cfg, state, _prefs(cfg, state, cid)["teams"])
     if not summary:
         telegram_send(cfg, "No check has finished yet - try again in a few minutes.",
                       chats=[cid])
@@ -1806,6 +1957,10 @@ def _send_status(cfg: Config, state: dict, cid: str) -> None:
 
 
 def _handle_callback(cfg: Config, state: dict, cb: dict) -> None:
+    data = str(cb.get("data") or "")
+    if data in ("tnext", "mdone") or data[:2] in ("t:", "m:"):
+        _handle_prefs_callback(cfg, state, cb)
+        return
     owner_ok = str((cb.get("from") or {}).get("id")) == cfg.telegram_chat
     action, _, cid = str(cb.get("data") or "").partition(":")
     msg = cb.get("message") or {}
@@ -1816,6 +1971,9 @@ def _handle_callback(cfg: Config, state: dict, cb: dict) -> None:
     info = (state["pending"].pop(cid, None) or state["subscribers"].get(cid)
             or state["blocked"].get(cid) or {})
     name = info.get("name", cid)
+    if action in ("deny", "remove"):
+        state["prefs"].pop(cid, None)
+        state["prefs_draft"].pop(cid, None)
     if action == "unblock":
         state["blocked"].pop(cid, None)
         result = f"↩️ Unblocked: {name} (they can /start again)"
@@ -1849,8 +2007,10 @@ def _handle_callback(cfg: Config, state: dict, cb: dict) -> None:
         _tg(cfg, "sendMessage", chat_id=cfg.telegram_chat, text=result)
 
 
-def poll_access_requests(cfg: Config) -> None:
-    """Read new Telegram updates (cheap; the loop calls this every minute)."""
+def poll_access_requests(cfg: Config, wait: int = 0) -> None:
+    """Read new Telegram updates. With `wait` > 0 Telegram holds the request
+    up to that many seconds until something arrives (long polling), so the
+    loop answers taps and commands within a second or two."""
     if not cfg.telegram_token or not cfg.telegram_chat:
         return
     state = load_state(cfg.state_file)
@@ -1868,8 +2028,9 @@ def poll_access_requests(cfg: Config) -> None:
             _subscribe(cfg, state, cid, info.get("name", cid))
             _tell_owner_joined(cfg, cid, info.get("name", cid))
         changed = True
-    updates = _tg(cfg, "getUpdates", offset=int(state.get("tg_offset") or 0),
-                  timeout=0, allowed_updates=["message", "callback_query"])
+    updates = _tg(cfg, "getUpdates", http_timeout=wait + REQUEST_TIMEOUT,
+                  offset=int(state.get("tg_offset") or 0), timeout=wait,
+                  allowed_updates=["message", "callback_query"])
     if not updates and not changed:
         return
     for upd in updates or []:
@@ -2031,7 +2192,8 @@ def _process_source(cfg: Config, src: "Source", state: dict,
         # "level" = the sale phase already alerted; entries from before
         # members alerts existed have none and were public alerts.
         level = (entry or {}).get("level", "AVAILABLE")
-        members = ev.status == "MEMBERS" and src.member_alerts
+        members = (ev.status == "MEMBERS" and src.club
+                   and bool(_recipients(cfg, state, src.id, members=True)))
         if ev.status == "AVAILABLE" or members:
             if entry is not None and (members or level == "AVAILABLE"):
                 # Already alerted for this phase (or public sale fell back to
@@ -2040,11 +2202,11 @@ def _process_source(cfg: Config, src: "Source", state: dict,
                 entry["level"] = ev.status
                 dirty = True
                 continue
-            # Members-only sales go to the owner alone - other recipients
-            # aren't necessarily club members.
-            chats = [cfg.telegram_chat] if members else None
-            if telegram_send(cfg, format_notification(ev, src.name, members),
-                             chats=chats):
+            # Members-only sales: only users who said they're members there.
+            chats = _recipients(cfg, state, src.id, members=ev.status == "MEMBERS")
+            if not chats or telegram_send(
+                    cfg, format_notification(ev, src.name, ev.status == "MEMBERS"),
+                    chats=chats):
                 log.info("[%s] notified (%s): %s", src.id, ev.status, ev.title)
                 notified[key] = {
                     "source": src.id,
@@ -2083,35 +2245,36 @@ def run_normal(cfg: Config) -> int:
     dirty = True
 
     now_iso = _now_utc().isoformat()
-    blocks: list[str] = []
-    statuses: list[str] = []
+    blocks: dict[str, str] = {}
+    statuses: dict[str, list[str]] = {}
     found: dict[str, list | None] = {}
     for src in cfg.sources:
         changed, block, sts, events = _process_source(cfg, src, state, now_iso)
         dirty = dirty or changed
-        blocks.append(block)
-        statuses.extend(sts)
+        blocks[src.id] = block
+        statuses[src.id] = sts
         found[src.id] = events
 
-    header = (f"🔎 <b>Ticket check</b> · {now_lisbon.strftime('%H:%M %d.%m')}\n"
-              f"{_totals_line(statuses)}")
-    summary = _pack_messages(header, blocks)
-    state["last_summary"] = summary  # served by /status
+    # Served by /status (filtered per user) and used for the reports below.
+    state["last_report"] = {"time": now_lisbon.strftime("%H:%M %d.%m"),
+                            "blocks": blocks, "statuses": statuses}
+    state.pop("last_summary", None)  # pre-preferences format
     first_snapshot = "snapshot" not in state
     change_blocks = _diff_snapshot(cfg, state, found)
     if cfg.report_mode == "every":
-        for msg in summary:
-            telegram_send(cfg, msg, preview=False)  # many links: no preview card
+        _send_by_teams(cfg, state, lambda teams: _report_messages(cfg, state, teams))
     elif first_snapshot:
         intro = ("ℹ️ <b>From now on you'll only get a message when something "
                  "changes</b> (tickets go on sale, a match sells out, a new match "
                  "appears...). Send /status any time for the full overview.\n\n")
-        for i, msg in enumerate(summary):
-            telegram_send(cfg, (intro if i == 0 else "") + msg, preview=False)
+        _send_by_teams(cfg, state, lambda teams: [
+            (intro if i == 0 else "") + m
+            for i, m in enumerate(_report_messages(cfg, state, teams))])
     elif change_blocks:
         head = f"🔔 <b>Changes</b> · {now_lisbon.strftime('%H:%M %d.%m')}"
-        for msg in _pack_messages(head, change_blocks):
-            telegram_send(cfg, msg, preview=False)
+        _send_by_teams(cfg, state, lambda teams: _pack_messages(
+            head, [change_blocks[sid] for sid in teams if sid in change_blocks])
+            if any(sid in change_blocks for sid in teams) else [])
 
     if _prune_state(state, now_iso):
         dirty = True
@@ -2120,6 +2283,17 @@ def run_normal(cfg: Config) -> int:
         save_state(cfg.state_file, state)
         set_output("state_changed", "true")
     return 0
+
+
+def _send_by_teams(cfg: Config, state: dict, build) -> None:
+    """Send build(teams) to every recipient, each getting only their teams;
+    recipients with the same teams share one build."""
+    groups: dict[tuple, list[str]] = {}
+    for cid in _all_chats(cfg):
+        groups.setdefault(tuple(_prefs(cfg, state, cid)["teams"]), []).append(cid)
+    for teams, chats in groups.items():
+        for msg in build(list(teams)):
+            telegram_send(cfg, msg, preview=False, chats=chats)  # no preview cards
 
 
 def _event_line(ev, prefix: str) -> list[str]:
@@ -2132,7 +2306,7 @@ def _event_line(ev, prefix: str) -> list[str]:
     return lines
 
 
-def _diff_snapshot(cfg: Config, state: dict, found: dict) -> list[str]:
+def _diff_snapshot(cfg: Config, state: dict, found: dict) -> dict[str, str]:
     """Update state["snapshot"] and return per-team blocks of what changed.
 
     A change is a new match or a status change. Changes *to* "on sale" are
@@ -2142,7 +2316,7 @@ def _diff_snapshot(cfg: Config, state: dict, found: dict) -> list[str]:
     """
     old = state.get("snapshot") or {}
     new: dict[str, dict] = {}
-    blocks = []
+    blocks: dict[str, str] = {}
     for src in cfg.sources:
         events = found.get(src.id)
         if events is None:
@@ -2164,7 +2338,7 @@ def _diff_snapshot(cfg: Config, state: dict, found: dict) -> list[str]:
             else:
                 lines += _event_line(ev, f"{_STATUS_DOT.get(prev, '⚪️')} → {dot}")
         if lines:
-            blocks.append("\n".join([_source_heading(src)] + lines))
+            blocks[src.id] = "\n".join([_source_heading(src)] + lines)
     state["snapshot"] = new
     return blocks
 
@@ -2205,6 +2379,7 @@ def run_loop(cfg: Config, minutes: float) -> int:
     if cfg.telegram_token:  # command menu shown in Telegram's "/" button
         _tg(cfg, "setMyCommands", commands=[
             {"command": "status", "description": "Current ticket overview"},
+            {"command": "settings", "description": "Choose teams / membership"},
             {"command": "start", "description": "Subscribe to ticket alerts"},
             {"command": "stop", "description": "Stop receiving messages"}])
     while True:
@@ -2224,9 +2399,25 @@ def run_loop(cfg: Config, minutes: float) -> int:
             break
         if time.monotonic() + LOOP_POLL_SEC >= deadline:
             break
-        time.sleep(LOOP_POLL_SEC)
+        _wait_answering(cfg, LOOP_POLL_SEC)
     log.info("Loop mode: done.")
     return 0
+
+
+def _wait_answering(cfg: Config, seconds: float) -> None:
+    """Sleep `seconds`, answering Telegram messages/taps as they arrive."""
+    until = time.monotonic() + seconds
+    while (left := until - time.monotonic()) > 1:
+        if not cfg.telegram_token:
+            time.sleep(left)
+            return
+        t0 = time.monotonic()
+        try:
+            poll_access_requests(cfg, wait=int(min(left, 25)))
+        except Exception:  # noqa: BLE001 - keep the loop alive
+            log.exception("Telegram polling failed.")
+        if time.monotonic() - t0 < 1:  # error / no long-poll: don't spin
+            time.sleep(min(5, max(0, until - time.monotonic())))
 
 
 def _prune_state(state: dict, now_iso: str) -> bool:

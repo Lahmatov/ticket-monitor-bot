@@ -18,6 +18,7 @@
     "api_type": "json",
     "api_url": "https://tickets.sporting.pt/api/match/allopengames",
     "parser": "sporting_api",
+    "club": true,
     "member_alerts": true,
     "keywords": [],
     "exclude_keywords": [
@@ -78,6 +79,7 @@
     "url": "https://www.slbenfica.pt/pt-pt/bilhetes",
     "api_type": "html",
     "parser": "benfica",
+    "club": true,
     "keywords": [],
     "exclude_keywords": [
       "feminino",
@@ -98,6 +100,7 @@
     "api_type": "json",
     "api_url": "https://bilhetes-api.fcporto.pt/api/graphql",
     "parser": "fcporto",
+    "club": true,
     "keywords": [],
     "exclude_keywords": [
       "feminino",
