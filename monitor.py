@@ -291,6 +291,11 @@ class Config:
                                if c]
         self.telegram_chat = self.telegram_chats[0] if self.telegram_chats else ""
         self.subscribers: list[str] = []  # approved via the bot (from state)
+        # ACCESS_MODE: "open" (default) = anyone who sends /start subscribes
+        # at once, the owner just gets a notice; "approval" = the owner must
+        # tap Allow first.
+        self.open_access = (os.environ.get("ACCESS_MODE", "open").strip().lower()
+                            != "approval")
         # REPORT_MODE: "changes" (default) = message only when a match's status
         # changes or a new match appears; "every" = full summary every check.
         # (Legacy REPORT_EVERY_RUN=1 means "every".)
@@ -318,6 +323,7 @@ def load_state(path: str) -> dict:
     data.setdefault("failures", {})  # source_id -> consecutive failure count
     data.setdefault("subscribers", {})  # chat_id -> {name, since}: approved by owner
     data.setdefault("pending", {})  # chat_id -> {name, requested}: awaiting owner
+    data.setdefault("blocked", {})  # chat_id -> {name, since}: removed by the owner
     data.setdefault("tg_offset", 0)  # next Telegram update_id to read
     return data
 
@@ -1278,6 +1284,11 @@ def matches_keywords(event: Event, src: "Source") -> bool:
 # --------------------------------------------------------------------------- #
 
 
+# Chats that answered 403 (blocked the bot / deleted account); the next
+# Telegram poll drops them from the subscribers.
+_GONE_CHATS: set[str] = set()
+
+
 def telegram_send(cfg: Config, text: str, preview: bool = True,
                   chats: list[str] | None = None) -> bool:
     """Send to every recipient (default: all TELEGRAM_CHAT_ID entries).
@@ -1309,6 +1320,8 @@ def _telegram_send_one(cfg: Config, chat: str, text: str, preview: bool) -> bool
                 return True
             # Recipient blocked the bot / never pressed Start: retrying won't help.
             if resp.status_code in (400, 403):
+                if resp.status_code == 403:
+                    _GONE_CHATS.add(str(chat))
                 log.warning("Telegram: chat ...%s rejected the message (%s): %s",
                             str(chat)[-3:], resp.status_code, resp.text[:200])
                 return False
@@ -1666,7 +1679,7 @@ def run_chatid(cfg: Config) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Access requests: anyone may ask with /start, the owner approves in Telegram #
+# Access: /start subscribes (open mode) or asks the owner (approval mode)    #
 # --------------------------------------------------------------------------- #
 
 
@@ -1700,18 +1713,41 @@ def _ask_owner(cfg: Config, cid: str, name: str) -> None:
             {"text": "❌ Deny", "callback_data": f"deny:{cid}"}]]})
 
 
+def _tell_owner_joined(cfg: Config, cid: str, name: str) -> None:
+    _tg(cfg, "sendMessage", chat_id=cfg.telegram_chat, parse_mode="HTML",
+        text=f"🆕 <b>{_esc(name)}</b> subscribed to the ticket bot.",
+        reply_markup={"inline_keyboard": [[
+            {"text": "🚫 Remove & block", "callback_data": f"remove:{cid}"}]]})
+
+
+def _subscribe(cfg: Config, state: dict, cid: str, name: str) -> None:
+    state["pending"].pop(cid, None)
+    state["subscribers"][cid] = {"name": name, "since": _now_utc().isoformat()}
+    _tg(cfg, "sendMessage", chat_id=cid,
+        text="✅ You're subscribed! You'll get a message as soon as tickets go on "
+             "sale or a match's status changes (Portugal, Sporting, Benfica, "
+             "Porto). Send /status any time for the full overview, /stop to "
+             "unsubscribe.")
+    _send_status(cfg, state, cid)
+
+
 def _list_for_owner(cfg: Config, state: dict) -> None:
-    subs = state["subscribers"]
-    if not subs:
+    subs, blocked = state["subscribers"], state["blocked"]
+    if not subs and not blocked:
         _tg(cfg, "sendMessage", chat_id=cfg.telegram_chat,
             text="Nobody else receives the bot's messages yet.")
         return
     rows = [[{"text": f"❌ Remove {v.get('name', k)}"[:60], "callback_data": f"remove:{k}"}]
             for k, v in subs.items()]
-    names = "\n".join(f"• {_esc(v.get('name', k))}" for k, v in subs.items())
+    rows += [[{"text": f"↩️ Unblock {v.get('name', k)}"[:60],
+               "callback_data": f"unblock:{k}"}] for k, v in blocked.items()]
+    lines = [f"👥 <b>Receiving the bot's messages ({len(subs)}):</b>"]
+    lines += [f"• {_esc(v.get('name', k))}" for k, v in subs.items()] or ["• nobody"]
+    if blocked:
+        lines += ["", f"🚫 <b>Blocked ({len(blocked)}):</b>"]
+        lines += [f"• {_esc(v.get('name', k))}" for k, v in blocked.items()]
     _tg(cfg, "sendMessage", chat_id=cfg.telegram_chat, parse_mode="HTML",
-        text=f"👥 <b>Also receiving the bot's messages:</b>\n{names}",
-        reply_markup={"inline_keyboard": rows})
+        text="\n".join(lines), reply_markup={"inline_keyboard": rows})
 
 
 def _handle_message(cfg: Config, state: dict, msg: dict) -> None:
@@ -1728,9 +1764,12 @@ def _handle_message(cfg: Config, state: dict, msg: dict) -> None:
         if cid == cfg.telegram_chat and text in ("/list", "/subscribers"):
             _list_for_owner(cfg, state)
         return
+    if cid in state["blocked"]:
+        say("Sorry, this bot isn't available for you.")
+        return
     if text == "/stop":
         if state["subscribers"].pop(cid, None) is not None:
-            say("You're unsubscribed. Send /start to ask again.")
+            say("You're unsubscribed. Send /start to subscribe again.")
             _tg(cfg, "sendMessage", chat_id=cfg.telegram_chat,
                 text=f"ℹ️ {name} unsubscribed.")
         state["pending"].pop(cid, None)
@@ -1738,6 +1777,13 @@ def _handle_message(cfg: Config, state: dict, msg: dict) -> None:
     if cid in state["subscribers"]:
         say("✅ You already receive the ticket updates. Send /status for the "
             "current overview, /stop to unsubscribe.")
+    elif cfg.open_access:
+        if text.split(maxsplit=1)[:1] != ["/start"]:
+            say("👋 Hi! This bot sends Portuguese football ticket alerts. "
+                "Send /start to subscribe.")
+            return
+        _subscribe(cfg, state, cid, name)
+        _tell_owner_joined(cfg, cid, name)
     elif cid in state["pending"]:
         say("⏳ Your request is waiting for the owner's approval.")
     else:
@@ -1763,13 +1809,18 @@ def _handle_callback(cfg: Config, state: dict, cb: dict) -> None:
     owner_ok = str((cb.get("from") or {}).get("id")) == cfg.telegram_chat
     action, _, cid = str(cb.get("data") or "").partition(":")
     msg = cb.get("message") or {}
-    if not owner_ok or action not in ("allow", "deny", "remove") or not cid:
+    if not owner_ok or action not in ("allow", "deny", "remove", "unblock") or not cid:
         _tg(cfg, "answerCallbackQuery", callback_query_id=cb.get("id"),
             text="Only the bot's owner can do that.")
         return
-    info = state["pending"].pop(cid, None) or state["subscribers"].get(cid) or {}
+    info = (state["pending"].pop(cid, None) or state["subscribers"].get(cid)
+            or state["blocked"].get(cid) or {})
     name = info.get("name", cid)
-    if action == "allow":
+    if action == "unblock":
+        state["blocked"].pop(cid, None)
+        result = f"↩️ Unblocked: {name} (they can /start again)"
+    elif action == "allow":
+        state["blocked"].pop(cid, None)
         state["subscribers"][cid] = {"name": name, "since": _now_utc().isoformat()}
         _tg(cfg, "sendMessage", chat_id=cid,
             text="✅ Access granted! You'll get a message as soon as tickets go on "
@@ -1785,9 +1836,13 @@ def _handle_callback(cfg: Config, state: dict, cb: dict) -> None:
         state["subscribers"].pop(cid, None)
         _tg(cfg, "sendMessage", chat_id=cid,
             text="The owner removed you from the ticket bot's recipients.")
-        result = f"🗑 Removed: {name}"
+        if cfg.open_access:  # otherwise they could just /start again
+            state["blocked"][cid] = {"name": name, "since": _now_utc().isoformat()}
+            result = f"🚫 Removed & blocked: {name}"
+        else:
+            result = f"🗑 Removed: {name}"
     _tg(cfg, "answerCallbackQuery", callback_query_id=cb.get("id"), text=result)
-    if msg.get("message_id") and action != "remove":
+    if msg.get("message_id") and action not in ("remove", "unblock"):
         _tg(cfg, "editMessageText", chat_id=cfg.telegram_chat,
             message_id=msg["message_id"], text=result)
     else:
@@ -1799,11 +1854,25 @@ def poll_access_requests(cfg: Config) -> None:
     if not cfg.telegram_token or not cfg.telegram_chat:
         return
     state = load_state(cfg.state_file)
+    changed = False
+    gone = [c for c in _GONE_CHATS if c in state["subscribers"]]
+    for cid in gone:  # they blocked the bot: stop sending to them
+        info = state["subscribers"].pop(cid)
+        _tg(cfg, "sendMessage", chat_id=cfg.telegram_chat,
+            text=f"ℹ️ {info.get('name', cid)} blocked the bot - unsubscribed.")
+        changed = True
+    _GONE_CHATS.clear()
+    if cfg.open_access and state["pending"]:
+        # Requests left over from approval mode: let them in now.
+        for cid, info in list(state["pending"].items()):
+            _subscribe(cfg, state, cid, info.get("name", cid))
+            _tell_owner_joined(cfg, cid, info.get("name", cid))
+        changed = True
     updates = _tg(cfg, "getUpdates", offset=int(state.get("tg_offset") or 0),
                   timeout=0, allowed_updates=["message", "callback_query"])
-    if not updates:
+    if not updates and not changed:
         return
-    for upd in updates:
+    for upd in updates or []:
         state["tg_offset"] = max(int(state.get("tg_offset") or 0),
                                  int(upd.get("update_id", 0)) + 1)
         try:
@@ -2136,7 +2205,7 @@ def run_loop(cfg: Config, minutes: float) -> int:
     if cfg.telegram_token:  # command menu shown in Telegram's "/" button
         _tg(cfg, "setMyCommands", commands=[
             {"command": "status", "description": "Current ticket overview"},
-            {"command": "start", "description": "Ask for access"},
+            {"command": "start", "description": "Subscribe to ticket alerts"},
             {"command": "stop", "description": "Stop receiving messages"}])
     while True:
         try:
