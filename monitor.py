@@ -1545,7 +1545,9 @@ def _probe_css(url: str, selector: str) -> None:
             chain.append(f"{a.name}{'#' + a['id'] if a.get('id') else ''}"
                          f"{'.' + cls if cls else ''}")
         print("  @", " < ".join(chain[:6]))
-        print("   ", _norm_ws(el.get_text(" "))[:300])
+        print("   ", _norm_ws(el.get_text(" "))[:300],
+              f"[href={el.get('href')}]" if el.get("href") else "",
+              f"[class={'.'.join(el.get('class') or [])}]")
 
 
 _CHUNK_RE = re.compile(r'["\'(](?:\./|/)?((?:chunk|[a-z0-9\-]+)-[A-Z0-9]{8}\.js)["\')]')
