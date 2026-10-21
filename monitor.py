@@ -760,9 +760,8 @@ def drop_past(events: list[Event], now: datetime | None = None) -> list[Event]:
 FPF_BUY_URL = "https://bilheteira.fpf.pt/checkout/{code}"
 # Youth / women's / futsal / beach national teams (Tags like "CZE,POR,SUB21",
 # competitions like "CAMP. EUROPA S21 ..."): not the senior men's team.
-_FPF_NOT_A_TEAM_TAG = re.compile(r"^(SUB\d*|U\d+|FEM\w*|FUTSAL|PRAIA|BEACH)$", re.I)
-_FPF_NOT_A_TEAM_COMP = re.compile(r"\bS\d{2}\b|\bsub[- ]?\d{2}|\bU\d{2}\b|femin|futsal|praia",
-                                  re.I)
+_FPF_NOT_A_TEAM_TAG = re.compile(r"^(SUB\d*|U\d+|FEM\w*|PRAIA|BEACH)$", re.I)
+_FPF_NOT_A_TEAM_COMP = re.compile(r"\bS\d{2}\b|\bsub[- ]?\d{2}|\bU\d{2}\b|femin|praia", re.I)
 
 
 def _fmt_sale_opens(dt: datetime) -> str:
@@ -798,6 +797,11 @@ def parse_fpf_odata(data, src: "Source") -> list[Event]:
         tags = [t.strip() for t in str(it.get("Tags") or "").split(",") if t.strip()]
         comp = _norm_ws(str(it.get("CompetitionName") or ""))
         if any(_FPF_NOT_A_TEAM_TAG.match(t) for t in tags) or _FPF_NOT_A_TEAM_COMP.search(comp):
+            continue
+        # The FPF sells football and futsal; each source keeps its own sport.
+        is_futsal = (any(t.upper() == "FUTSAL" for t in tags)
+                     or "futsal" in f"{comp} {it.get('Name') or ''}".lower())
+        if is_futsal != (src.sport == "futsal"):
             continue
         home = _norm_ws(str(it.get("HomeTeamName") or ""))
         away = _norm_ws(str(it.get("AwayTeamName") or ""))
@@ -880,7 +884,8 @@ def _sporting_games(data, modality: str = "futebol") -> list[dict]:
 
 # tickets.sporting.pt "modality" per sport (one source per sport).
 _SPORTING_MODALITY = {"football": "futebol", "volleyball": "voleibol",
-                      "basketball": "basquetebol"}
+                      "basketball": "basquetebol", "futsal": "futsal",
+                      "roller_hockey": "hóquei", "handball": "andebol"}
 
 
 def _sporting_modality(src: "Source") -> str:
@@ -1019,7 +1024,8 @@ _FCPORTO_STATUS = {
 
 
 _FCPORTO_SPORT = {"football": "FOOTBALL", "volleyball": "VOLLEYBALL",
-                  "basketball": "BASKETBALL"}
+                  "basketball": "BASKETBALL", "futsal": "FUTSAL",
+                  "roller_hockey": "ROLLER_HOCKEY", "handball": "HANDBALL"}
 
 
 def fetch_fcporto(src: "Source") -> str:
@@ -1133,7 +1139,8 @@ _BENFICA_BADGE_EN = {
 
 # slbenfica.pt card label (".type-game") per sport.
 _BENFICA_SPORT = {"football": "futebol", "volleyball": "voleibol",
-                  "basketball": "basquetebol"}
+                  "basketball": "basquetebol", "futsal": "futsal",
+                  "roller_hockey": "hóquei", "handball": "andebol"}
 
 
 def parse_benfica(html: str, src: "Source") -> list[Event]:
@@ -1317,8 +1324,11 @@ def loads_json(raw: str, src: "Source"):
 # --------------------------------------------------------------------------- #
 
 SMARTFAN_BUY_URL = "https://smartfan.tickets/comprar-bilhetes?ev={id}"
-_SMARTFAN_SPORT = {"football": "FOOTBALL", "volleyball": "VOLLEYBALL",
-                   "basketball": "BASKETBALL"}
+# Sport.Name in GetActiveGames; names not seen live yet are matched loosely.
+_SMARTFAN_SPORT = {"football": ("FOOTBALL",), "volleyball": ("VOLLEYBALL",),
+                   "basketball": ("BASKETBALL",), "futsal": ("FUTSAL",),
+                   "roller_hockey": ("HOCKEY", "HOQUEI", "HÓQUEI"),
+                   "handball": ("HANDBALL", "ANDEBOL")}
 
 
 def fetch_smartfan(src: "Source") -> str:
@@ -1344,14 +1354,16 @@ def parse_smartfan(data, src: "Source") -> list[Event]:
         if isinstance(data, dict) else {}
     if isinstance(data, dict) and data.get("OpInfoStatus") not in (None, "OK"):
         raise ValueError(f"smartfan replied {data.get('OpInfoStatus')!r}")
-    want_sport = _SMARTFAN_SPORT.get(src.sport, src.sport.upper())
+    want_sport = _SMARTFAN_SPORT.get(src.sport, (src.sport.upper(),))
     want_team = src.team_name.strip().lower()
     now = _now_utc()
     events: list[Event] = []
     for g in value.get("Games") or []:
         if not isinstance(g, dict):
             continue
-        if str((g.get("Sport") or {}).get("Name") or "").upper() != want_sport:
+        sport = str((g.get("Sport") or {}).get("Name") or "").upper()
+        if not any(w in sport for w in want_sport) or (
+                src.sport == "football" and "FUTSAL" in sport):
             continue
         home = _norm_ws(str((g.get("HomeTeam") or {}).get("Name") or ""))
         away = _norm_ws(str((g.get("VisitingTeam") or {}).get("Name") or ""))
@@ -2017,8 +2029,10 @@ def _all_chats(cfg: Config) -> list[str]:
     return cfg.telegram_chats + [c for c in cfg.subscribers if c not in cfg.telegram_chats]
 
 
-SPORTS = {"football": "⚽ Football", "volleyball": "🏐 Volleyball",
-          "basketball": "🏀 Basketball", "tennis": "🎾 Tennis"}
+SPORTS = {"football": "⚽ Football", "futsal": "🥅 Futsal",
+          "volleyball": "🏐 Volleyball", "basketball": "🏀 Basketball",
+          "handball": "🤾 Handball", "roller_hockey": "🏑 Roller hockey",
+          "tennis": "🎾 Tennis"}
 
 
 def _teams_of(cfg: Config) -> dict[str, "Source"]:
