@@ -59,8 +59,16 @@ def explore(browser, url):
             post = "\n    POST BODY: " + re.sub(r"\s+", " ", resp.request.post_data)[:4000]
         if ONLY_RE and not ONLY_RE.search(u + post):
             return
+        hdrs = ""
+        if ONLY_RE:  # a narrowed run: also show what the page sent (minus cookies)
+            try:
+                sent = resp.request.all_headers()
+            except Exception:  # noqa: BLE001
+                sent = resp.request.headers
+            hdrs = "\n    REQUEST HEADERS: " + json.dumps(
+                {k: v for k, v in sent.items() if k.lower() not in ("cookie",)})
         captured.append(f"[{resp.status}] {resp.request.method} {u}  ({ctype[:30]}, "
-                        f"{len(body)}b){post}\n    {short(body, BODY_CHARS)}")
+                        f"{len(body)}b){post}{hdrs}\n    {short(body, BODY_CHARS)}")
 
     page.on("response", on_response)
     try:
