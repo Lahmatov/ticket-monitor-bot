@@ -1526,6 +1526,28 @@ def _probe_get(url: str) -> None:
     print("  body (first 2500 chars):", _norm_ws(r.text)[:2500] or "(empty)")
 
 
+def _probe_css(url: str, selector: str) -> None:
+    """Print each element matching a CSS selector: its ancestors' classes
+    (to see which tab/section it sits in) and its text."""
+    try:
+        soup = BeautifulSoup(fetch(url), "html.parser")
+    except Exception as err:  # noqa: BLE001
+        print(f"\n=== CSS in {url}: fetch failed: {err} ===")
+        return
+    found = soup.select(selector)
+    print(f"\n=== CSS {selector!r} in {url}: {len(found)} match(es) ===")
+    for el in found[:60]:
+        chain = []
+        for a in el.parents:
+            if a.name in (None, "[document]", "html", "body"):
+                continue
+            cls = ".".join(a.get("class") or [])
+            chain.append(f"{a.name}{'#' + a['id'] if a.get('id') else ''}"
+                         f"{'.' + cls if cls else ''}")
+        print("  @", " < ".join(chain[:6]))
+        print("   ", _norm_ws(el.get_text(" "))[:300])
+
+
 _CHUNK_RE = re.compile(r'["\'(](?:\./|/)?((?:chunk|[a-z0-9\-]+)-[A-Z0-9]{8}\.js)["\')]')
 
 
@@ -1589,7 +1611,9 @@ def run_probe(cfg: Config) -> int:
             u = u.strip()
             if not u:
                 continue
-            if grep:
+            if grep.startswith("css:"):
+                _probe_css(u, grep[4:])
+            elif grep:
                 _probe_grep(u, grep)
             else:
                 _probe_get(u)
