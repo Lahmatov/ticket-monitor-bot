@@ -53,7 +53,7 @@ import sys
 import random
 import time
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -389,18 +389,20 @@ _FETCH_MEMO: dict[tuple, str] = {}
 
 
 def fetch(url: str, accept: str = "text/html,application/xhtml+xml",
-          json_body: dict | None = None, extra_headers: dict | None = None) -> str:
-    """GET url (or POST json_body) with retries; return the response text."""
-    key = (url, accept, json.dumps(json_body, sort_keys=True) if json_body else "")
+          json_body: dict | None = None, extra_headers: dict | None = None,
+          form_body: dict | None = None) -> str:
+    """GET url (or POST json_body / form_body) with retries; return the text."""
+    key = (url, accept, json.dumps(json_body, sort_keys=True) if json_body else "",
+           json.dumps(form_body, sort_keys=True) if form_body else "")
     if key in _FETCH_MEMO:
         return _FETCH_MEMO[key]
-    text = _fetch_uncached(url, accept, json_body, extra_headers)
+    text = _fetch_uncached(url, accept, json_body, extra_headers, form_body)
     _FETCH_MEMO[key] = text
     return text
 
 
 def _fetch_uncached(url: str, accept: str, json_body: dict | None,
-                    extra_headers: dict | None) -> str:
+                    extra_headers: dict | None, form_body: dict | None = None) -> str:
     headers = {
         "User-Agent": USER_AGENT,
         "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
@@ -412,6 +414,9 @@ def _fetch_uncached(url: str, accept: str, json_body: dict | None,
         try:
             if json_body is not None:
                 resp = requests.post(url, json=json_body, headers=headers,
+                                     timeout=REQUEST_TIMEOUT)
+            elif form_body is not None:
+                resp = requests.post(url, data=form_body, headers=headers,
                                      timeout=REQUEST_TIMEOUT)
             else:
                 resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
@@ -1653,14 +1658,28 @@ def run_probe(cfg: Config) -> int:
     direct = os.environ.get("PROBE_URL", "").strip()
     grep = os.environ.get("PROBE_GREP", "").strip()
     post = os.environ.get("PROBE_POST", "").strip()
-    if direct and post:  # POST a JSON body (e.g. a GraphQL query) and dump the reply
+    if direct and post:  # POST a body (JSON, or "form:a=1&b=2") and dump the reply
         print(f"\n=== POST {direct} ===")
+        origin = {"Origin": f"https://{urlparse(direct).netloc}"}
         try:
-            body = fetch(direct, accept="application/json", json_body=json.loads(post),
-                         extra_headers={"Origin": f"https://{urlparse(direct).netloc}"})
+            if post.startswith("form:"):
+                body = fetch(direct, accept="application/json", extra_headers=origin,
+                             form_body=dict(parse_qsl(post[5:])))
+            else:
+                body = fetch(direct, accept="application/json",
+                             json_body=json.loads(post), extra_headers=origin)
         except Exception as err:  # noqa: BLE001
             body = f"request error: {err}"
-        print(_norm_ws(body)[:4000])
+        body = _norm_ws(body)
+        if not grep:
+            print(body[:4000])
+            return 0
+        print(f"({len(body)} chars)")
+        for term in filter(None, (t.strip() for t in grep.split(","))):
+            hits = [m.start() for m in re.finditer(re.escape(term), body, re.IGNORECASE)]
+            print(f"  [{term}] {len(hits)} hit(s)")
+            for i in hits[:10]:
+                print("     …", body[max(0, i - 300):i + 500], "…")
         return 0
     if direct:
         for u in direct.split(","):
