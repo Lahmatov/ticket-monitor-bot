@@ -216,7 +216,8 @@ class Source:
                  event_selector="", title_selector="", link_selector="",
                  api_url="", api_type="html", browse_url="",
                  wait_selector="", wait_ms=0, parser="", emoji="", event_url="",
-                 member_alerts=False, club=False):
+                 member_alerts=False, club=False, team="", team_name="",
+                 sport="football"):
         self.id = str(id).strip()
         self.name = str(name).strip() or self.id
         self.url = str(url).strip()
@@ -245,6 +246,11 @@ class Source:
         # A club with members (sócios): offered in the onboarding's
         # membership question.
         self.club = bool(club)
+        # Several sources can belong to one team (one per sport); onboarding
+        # asks for sports and teams, a user receives the sources matching both.
+        self.team = (team or "").strip() or self.id
+        self.team_name = (team_name or "").strip() or self.name
+        self.sport = (sport or "football").strip().lower()
 
 
 def _sources_from_env() -> list[Source] | None:
@@ -376,9 +382,25 @@ def should_act(now_lisbon: datetime, state: dict) -> tuple[bool, bool]:
 # --------------------------------------------------------------------------- #
 
 
+# Responses already fetched during the current check. Several sources share
+# one site/API (one source per sport), so each URL is downloaded once per
+# check. Cleared at the start of every check; failures are not cached.
+_FETCH_MEMO: dict[tuple, str] = {}
+
+
 def fetch(url: str, accept: str = "text/html,application/xhtml+xml",
           json_body: dict | None = None, extra_headers: dict | None = None) -> str:
     """GET url (or POST json_body) with retries; return the response text."""
+    key = (url, accept, json.dumps(json_body, sort_keys=True) if json_body else "")
+    if key in _FETCH_MEMO:
+        return _FETCH_MEMO[key]
+    text = _fetch_uncached(url, accept, json_body, extra_headers)
+    _FETCH_MEMO[key] = text
+    return text
+
+
+def _fetch_uncached(url: str, accept: str, json_body: dict | None,
+                    extra_headers: dict | None) -> str:
     headers = {
         "User-Agent": USER_AGENT,
         "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
@@ -825,8 +847,9 @@ SPORTING_GAME_API = ("https://tickets.sporting.pt/api/match/opengames"
                      "?gamecode={token}&queueItToken=null")
 
 
-def _sporting_games(data) -> list[dict]:
-    """Upcoming football games from an allopengames response."""
+def _sporting_games(data, modality: str = "futebol") -> list[dict]:
+    """Upcoming games of one modality ("futebol", "voleibol", ...) from an
+    allopengames response."""
     games = []
     if isinstance(data, dict):
         d = data.get("data")
@@ -839,8 +862,9 @@ def _sporting_games(data) -> list[dict]:
     for g in games:
         if not isinstance(g, dict):
             continue
-        # Football only (drops futsal/handball/other modalities).
-        if str(g.get("modality", "")).strip().lower() not in ("futebol", "football"):
+        # One modality only (football drops futsal/handball/...).
+        mod = _norm_ws(str(g.get("modality") or "")).lower()
+        if mod != modality and not (modality == "futebol" and mod == "football"):
             continue
         start = _parse_start(g.get("date"))
         if start is not None and start.timestamp() < cutoff:
@@ -849,7 +873,16 @@ def _sporting_games(data) -> list[dict]:
     return out
 
 
-def fetch_sporting_details(data) -> dict:
+# tickets.sporting.pt "modality" per sport (one source per sport).
+_SPORTING_MODALITY = {"football": "futebol", "volleyball": "voleibol",
+                      "basketball": "basquetebol"}
+
+
+def _sporting_modality(src: "Source") -> str:
+    return _SPORTING_MODALITY.get(src.sport, src.sport)
+
+
+def fetch_sporting_details(data, modality: str = "futebol") -> dict:
     """token -> the game's own page data (GET opengames?gamecode=...).
 
     This is what the site loads when you open a match; unlike the listing it
@@ -858,7 +891,7 @@ def fetch_sporting_details(data) -> dict:
     are skipped; the parser then falls back to the listing.
     """
     details = {}
-    for g in _sporting_games(data):
+    for g in _sporting_games(data, modality):
         token = str(g.get("token") or "").strip()
         if not token:
             continue
@@ -903,7 +936,8 @@ def _sporting_status(g: dict, detail: dict | None) -> tuple[str, str]:
 
 # tickets.sporting.pt only exposes a venueId; the site itself just says
 # "Jogo Fora" for away games, so only Alvalade can be named.
-_SPORTING_VENUES = {1: "Estádio José Alvalade, Lisboa"}
+_SPORTING_VENUES = {1: "Estádio José Alvalade, Lisboa",
+                    12: "Pavilhão João Rocha, Lisboa"}
 
 
 def _sporting_venue(g: dict) -> str:
@@ -920,7 +954,7 @@ def parse_sporting_api(data, src: "Source", details: dict | None = None) -> list
     """Parse tickets.sporting.pt allopengames JSON (+ per-game page data)."""
     details = details or {}
     events: list[Event] = []
-    for g in _sporting_games(data):
+    for g in _sporting_games(data, _sporting_modality(src)):
         home = _norm_ws(str((g.get("homeTeam") or {}).get("name", "")))
         away = _norm_ws(str((g.get("awayTeam") or {}).get("name", "")))
         title = " x ".join(t for t in (home, away) if t) or "Sporting CP"
@@ -979,12 +1013,16 @@ _FCPORTO_STATUS = {
 }
 
 
+_FCPORTO_SPORT = {"football": "FOOTBALL", "volleyball": "VOLLEYBALL",
+                  "basketball": "BASKETBALL"}
+
+
 def fetch_fcporto(src: "Source") -> str:
     """POST the GraphQL query the bilhetes.fcporto.pt home page uses."""
     today = datetime.now(LISBON).strftime("%Y-%m-%d")
     body = {"query": FCPORTO_QUERY,
             "variables": {"pageSize": 12, "matchDate": {"from": today},
-                          "sport": "FOOTBALL"}}
+                          "sport": _FCPORTO_SPORT.get(src.sport, "FOOTBALL")}}
     return fetch(src.api_url, accept="application/json", json_body=body,
                  extra_headers={"Origin": "https://bilhetes.fcporto.pt",
                                 "Referer": "https://bilhetes.fcporto.pt/"})
@@ -1003,7 +1041,8 @@ def parse_fcporto(data, src: "Source") -> list[Event]:
         for g in (day or {}).get("matches") or []:
             if not isinstance(g, dict):
                 continue
-            if str(g.get("sport") or "").upper() not in ("FOOTBALL", ""):
+            if str(g.get("sport") or "").upper() not in (
+                    _FCPORTO_SPORT.get(src.sport, "FOOTBALL"), ""):
                 continue
             home = _norm_ws(str((g.get("homeTeam") or {}).get("shortName") or ""))
             away = _norm_ws(str((g.get("awayTeam") or {}).get("shortName") or ""))
@@ -1087,29 +1126,43 @@ _BENFICA_BADGE_EN = {
 }
 
 
+# slbenfica.pt card label (".type-game") per sport.
+_BENFICA_SPORT = {"football": "futebol", "volleyball": "voleibol",
+                  "basketball": "basquetebol"}
+
+
 def parse_benfica(html: str, src: "Source") -> list[Event]:
     """Parse slbenfica.pt/pt-pt/bilhetes (server-rendered match cards).
 
-    Only the "Equipa A" tab is used (the page also lists women's, B team,
-    U23 and Youth League games).
+    Football: only the "Equipa A" tab (the page also lists women's, B team,
+    U23 and Youth League games). Other sports: the "Modalidades" tab, cards
+    labelled with the sport (men's team: no "Feminino").
     """
     soup = BeautifulSoup(html, "html.parser")
     events: list[Event] = []
+    want = _BENFICA_SPORT.get(src.sport, src.sport)
     for card in soup.select("section.game-module"):
-        tab = card.find_parent(class_="tab-nav")
-        if tab is not None and "equipaA" not in (tab.get("class") or []):
-            continue  # another team's tab
         kind = _norm_ws(card.select_one(".type-game").get_text(" ")) \
             if card.select_one(".type-game") else ""
-        if kind and kind.lower() != "futebol":
-            continue
+        tab = card.find_parent(class_="tab-nav")
+        if src.sport != "football":
+            k = kind.lower()
+            if (card.find_parent(class_="modalidadesTickets") is None
+                    or not k.startswith(want) or "feminin" in k or "cadeira" in k):
+                continue
+        else:
+            if tab is not None and "equipaA" not in (tab.get("class") or []):
+                continue  # another team's tab
+            if kind and kind.lower() != "futebol":
+                continue
         link = None
         for a in card.select(".buttons-tickets a[href]"):
             href = a["href"]
             if "/loja/bilhetes/jogos/" in href and not href.endswith("#"):
                 link = a
                 break
-        if tab is None and (link is None or not re.search(r"/jogos/compra(v2)?/", link["href"])):
+        if (src.sport == "football" and tab is None
+                and (link is None or not re.search(r"/jogos/compra(v2)?/", link["href"]))):
             continue  # no tab info: keep only first-team ticket links
         teams = [_norm_ws(h.get_text(" ")) for h in card.select(".team h3.hidden-xs")]
         title = " x ".join(t for t in teams if t) or "SL Benfica"
@@ -1260,7 +1313,8 @@ def fetch_source_json(src: "Source") -> str:
 
 def parse_source_json(data, src: "Source") -> list[Event]:
     if src.parser == "sporting_api":
-        return parse_sporting_api(data, src, details=fetch_sporting_details(data))
+        return parse_sporting_api(data, src, details=fetch_sporting_details(
+            data, _sporting_modality(src)))
     if src.parser == "fcporto":
         return parse_fcporto(data, src)
     if src.parser == "fpf_odata":
@@ -1770,46 +1824,96 @@ def _all_chats(cfg: Config) -> list[str]:
     return cfg.telegram_chats + [c for c in cfg.subscribers if c not in cfg.telegram_chats]
 
 
-def _prefs(cfg: Config, state: dict, cid: str) -> dict:
-    """The user's choices; defaults: every team, membership only for the
-    owner on sources marked member_alerts."""
-    p = (state.get("prefs") or {}).get(cid) or {}
-    ids = [src.id for src in cfg.sources]
-    teams = [i for i in ids if i in p["teams"]] if "teams" in p else ids
-    if "member" in p:
-        member = p["member"]
-    elif cid == cfg.telegram_chat:
-        member = [src.id for src in cfg.sources if src.member_alerts]
-    else:
-        member = []
-    return {"teams": teams, "member": [i for i in member if i in teams]}
+SPORTS = {"football": "⚽ Football", "volleyball": "🏐 Volleyball",
+          "basketball": "🏀 Basketball"}
 
 
-def _recipients(cfg: Config, state: dict, sid: str, members: bool = False) -> list[str]:
-    key = "member" if members else "teams"
-    return [c for c in _all_chats(cfg) if sid in _prefs(cfg, state, c)[key]]
+def _teams_of(cfg: Config) -> dict[str, "Source"]:
+    """team id -> its first source (for the team's emoji / name / club flag)."""
+    out: dict[str, "Source"] = {}
+    for src in cfg.sources:
+        out.setdefault(src.team, src)
+    return out
 
 
 def _team_label(src: "Source") -> str:
-    return f"{src.emoji} {src.name}".strip()
+    return f"{src.emoji} {src.team_name}".strip()
 
 
-def _teams_keyboard(cfg: Config, sel: list[str]) -> dict:
-    rows = [[{"text": f"{'✅' if src.id in sel else '⬜️'} {_team_label(src)}",
-              "callback_data": f"t:{src.id}"}] for src in cfg.sources]
+def _sports_of(cfg: Config) -> list[str]:
+    return [sp for sp in SPORTS if any(src.sport == sp for src in cfg.sources)]
+
+
+def _prefs(cfg: Config, state: dict, cid: str) -> dict:
+    """The user's choices -> also the list of sources they receive.
+
+    Defaults (nothing chosen yet): football, every team; membership only for
+    the owner, on teams whose sources are marked member_alerts. Choices made
+    before sports existed ({teams, member} with source ids = team ids) mean
+    football.
+    """
+    p = (state.get("prefs") or {}).get(cid) or {}
+    teams_all = list(_teams_of(cfg))
+    sports = [sp for sp in _sports_of(cfg) if sp in p.get("sports", ["football"])]
+    teams = [t for t in teams_all if t in p["teams"]] if "teams" in p else teams_all
+    if "member" in p:
+        member = p["member"]
+    elif cid == cfg.telegram_chat:
+        member = [src.team for src in cfg.sources if src.member_alerts]
+    else:
+        member = []
+    return {"sports": sports, "teams": teams,
+            "member": [t for t in teams_all if t in member and t in teams],
+            "sources": [src.id for src in cfg.sources
+                        if src.sport in sports and src.team in teams]}
+
+
+def _recipients(cfg: Config, state: dict, sid: str, members: bool = False) -> list[str]:
+    """Who gets alerts for source `sid` (members=True: its members' sales)."""
+    team = next((src.team for src in cfg.sources if src.id == sid), sid)
+    out = []
+    for c in _all_chats(cfg):
+        p = _prefs(cfg, state, c)
+        if sid in p["sources"] and (not members or team in p["member"]):
+            out.append(c)
+    return out
+
+
+def _toggle_rows(items: list[tuple[str, str]], sel: list[str], prefix: str) -> list:
+    return [[{"text": f"{'✅' if key in sel else '⬜️'} {label}",
+              "callback_data": f"{prefix}:{key}"}] for key, label in items]
+
+
+def _sports_keyboard(cfg: Config, sel: list[str]) -> dict:
+    rows = _toggle_rows([(sp, SPORTS[sp]) for sp in _sports_of(cfg)], sel, "s")
+    rows.append([{"text": "Next ➡️", "callback_data": "snext"}])
+    return {"inline_keyboard": rows}
+
+
+def _available_teams(cfg: Config, sports: list[str]) -> list["Source"]:
+    """Teams that have a source in one of `sports` (e.g. no national team
+    for volleyball)."""
+    return [src for team, src in _teams_of(cfg).items()
+            if any(s.team == team and s.sport in sports for s in cfg.sources)]
+
+
+def _teams_keyboard(cfg: Config, sports: list[str], sel: list[str]) -> dict:
+    rows = _toggle_rows([(src.team, _team_label(src))
+                         for src in _available_teams(cfg, sports)], sel, "t")
     rows.append([{"text": "Next ➡️", "callback_data": "tnext"}])
     return {"inline_keyboard": rows}
 
 
 def _members_keyboard(cfg: Config, teams: list[str], sel: list[str]) -> dict:
-    rows = [[{"text": f"{'✅' if src.id in sel else '⬜️'} {_team_label(src)}",
-              "callback_data": f"m:{src.id}"}]
-            for src in cfg.sources if src.club and src.id in teams]
+    rows = _toggle_rows([(t, _team_label(src)) for t, src in _teams_of(cfg).items()
+                         if src.club and t in teams], sel, "m")
     rows.append([{"text": "Done ✔️", "callback_data": "mdone"}])
     return {"inline_keyboard": rows}
 
 
-_TEAMS_Q = ("⚙️ <b>Which teams do you want alerts for?</b>\n"
+_SPORTS_Q = ("⚙️ <b>Which sports do you want ticket alerts for?</b>\n"
+             "Tap to select, then press Next.")
+_TEAMS_Q = ("👥 <b>Which teams?</b>\n"
             "Tap to select, then press Next.")
 _MEMBERS_Q = ("🎟 <b>Are you a club member (sócio)?</b>\n"
               "Clubs often sell to members first. Tick the clubs where you're a "
@@ -1817,19 +1921,26 @@ _MEMBERS_Q = ("🎟 <b>Are you a club member (sócio)?</b>\n"
 
 
 def _start_onboarding(cfg: Config, state: dict, cid: str, fresh: bool = False) -> None:
-    cur = {"teams": [], "member": []} if fresh else _prefs(cfg, state, cid)
+    if fresh:
+        cur = {"sports": [], "teams": [], "member": []}
+    else:
+        p = _prefs(cfg, state, cid)
+        cur = {"sports": p["sports"], "teams": p["teams"], "member": p["member"]}
     state["prefs_draft"][cid] = cur
-    _tg(cfg, "sendMessage", chat_id=cid, parse_mode="HTML", text=_TEAMS_Q,
-        reply_markup=_teams_keyboard(cfg, cur["teams"]))
+    _tg(cfg, "sendMessage", chat_id=cid, parse_mode="HTML", text=_SPORTS_Q,
+        reply_markup=_sports_keyboard(cfg, cur["sports"]))
 
 
 def _finish_onboarding(cfg: Config, state: dict, cid: str, draft: dict,
                        message_id) -> None:
-    state["prefs"][cid] = {"teams": draft["teams"], "member": draft["member"]}
+    state["prefs"][cid] = {k: draft[k] for k in ("sports", "teams", "member")}
     state["prefs_draft"].pop(cid, None)
-    names = lambda ids: ", ".join(_team_label(src) for src in cfg.sources  # noqa: E731
-                                  if src.id in ids) or "none"
-    text = (f"✅ <b>All set!</b>\nFollowing: {_esc(names(draft['teams']))}\n"
+    teams = _teams_of(cfg)
+    names = lambda ids: ", ".join(_team_label(teams[t]) for t in teams  # noqa: E731
+                                  if t in ids) or "none"
+    sports = ", ".join(SPORTS[sp] for sp in SPORTS if sp in draft["sports"])
+    text = (f"✅ <b>All set!</b>\nSports: {_esc(sports)}\n"
+            f"Teams: {_esc(names(draft['teams']))}\n"
             f"Members' sale alerts: {_esc(names(draft['member']))}\n\n"
             "Change this any time with /settings.")
     if message_id:
@@ -1841,7 +1952,8 @@ def _finish_onboarding(cfg: Config, state: dict, cid: str, draft: dict,
 
 
 def _handle_prefs_callback(cfg: Config, state: dict, cb: dict) -> None:
-    """Taps on the onboarding / /settings keyboards (any recipient)."""
+    """Taps on the onboarding / /settings keyboards (any recipient):
+    sports -> teams -> memberships."""
     msg = cb.get("message") or {}
     cid = str((msg.get("chat") or {}).get("id") or (cb.get("from") or {}).get("id"))
     data = str(cb.get("data") or "")
@@ -1852,38 +1964,59 @@ def _handle_prefs_callback(cfg: Config, state: dict, cb: dict) -> None:
         return
     draft = state["prefs_draft"].get(cid)
     if draft is None:  # e.g. an old keyboard: continue from the saved choices
-        draft = state["prefs_draft"][cid] = _prefs(cfg, state, cid)
-    ids = {src.id for src in cfg.sources}
+        p = _prefs(cfg, state, cid)
+        draft = {"sports": p["sports"], "teams": p["teams"], "member": p["member"]}
+    draft.setdefault("sports", ["football"])  # draft from before sports existed
+    state["prefs_draft"][cid] = draft
     mid = msg.get("message_id")
-    action, _, sid = data.partition(":")
-    if action in ("t", "m") and sid in ids:
-        key = "teams" if action == "t" else "member"
-        sel = draft[key]
-        if sid in sel:
-            sel.remove(sid)
+    edit = lambda text, markup: _tg(  # noqa: E731
+        cfg, "editMessageText", chat_id=cid, message_id=mid, parse_mode="HTML",
+        text=text, reply_markup=markup)
+    action, _, key = data.partition(":")
+    valid = {"s": set(_sports_of(cfg)), "t": set(_teams_of(cfg)),
+             "m": {t for t, src in _teams_of(cfg).items() if src.club}}
+    if action in valid and key in valid[action]:
+        field = {"s": "sports", "t": "teams", "m": "member"}[action]
+        sel = draft[field]
+        if key in sel:
+            sel.remove(key)
         else:
-            sel.append(sid)
-        if key == "teams":
-            draft["member"] = [i for i in draft["member"] if i in sel]
-            markup = _teams_keyboard(cfg, sel)
+            sel.append(key)
+        if action == "s":
+            markup = _sports_keyboard(cfg, sel)
+        elif action == "t":
+            draft["member"] = [t for t in draft["member"] if t in sel]
+            markup = _teams_keyboard(cfg, draft["sports"], sel)
         else:
             markup = _members_keyboard(cfg, draft["teams"], sel)
         answer()
         _tg(cfg, "editMessageReplyMarkup", chat_id=cid, message_id=mid,
             reply_markup=markup)
+    elif data in ("tnext", "mdone") and not draft["sports"]:
+        answer("Pick a sport first.")  # an old keyboard skipped that step
+        edit(_SPORTS_Q, _sports_keyboard(cfg, draft["sports"]))
+    elif data == "snext":
+        if not draft["sports"]:
+            answer("Pick at least one sport.")
+            return
+        answer()
+        avail = [src.team for src in _available_teams(cfg, draft["sports"])]
+        draft["teams"] = [t for t in draft["teams"] if t in avail]
+        edit(_TEAMS_Q, _teams_keyboard(cfg, draft["sports"], draft["teams"]))
     elif data == "tnext":
+        avail = [src.team for src in _available_teams(cfg, draft["sports"])]
+        draft["teams"] = [t for t in draft["teams"] if t in avail]
         if not draft["teams"]:
             answer("Pick at least one team.")
             return
         answer()
-        clubs = [src for src in cfg.sources if src.club and src.id in draft["teams"]]
-        if not clubs:
+        draft["member"] = [t for t in draft["member"] if t in draft["teams"]]
+        teams = _teams_of(cfg)
+        if not any(teams[t].club for t in draft["teams"]):
             draft["member"] = []
             _finish_onboarding(cfg, state, cid, draft, mid)
             return
-        _tg(cfg, "editMessageText", chat_id=cid, message_id=mid, parse_mode="HTML",
-            text=_MEMBERS_Q, reply_markup=_members_keyboard(cfg, draft["teams"],
-                                                            draft["member"]))
+        edit(_MEMBERS_Q, _members_keyboard(cfg, draft["teams"], draft["member"]))
     elif data == "mdone":
         answer()
         _finish_onboarding(cfg, state, cid, draft, mid)
@@ -1973,7 +2106,7 @@ def _report_messages(cfg: Config, state: dict, teams: list[str]) -> list[str]:
 
 def _send_status(cfg: Config, state: dict, cid: str) -> None:
     """Reply with the summary of the latest check (the user's teams only)."""
-    summary = _report_messages(cfg, state, _prefs(cfg, state, cid)["teams"])
+    summary = _report_messages(cfg, state, _prefs(cfg, state, cid)["sources"])
     if not summary:
         telegram_send(cfg, "No check has finished yet - try again in a few minutes.",
                       chats=[cid])
@@ -1984,7 +2117,7 @@ def _send_status(cfg: Config, state: dict, cid: str) -> None:
 
 def _handle_callback(cfg: Config, state: dict, cb: dict) -> None:
     data = str(cb.get("data") or "")
-    if data in ("tnext", "mdone") or data[:2] in ("t:", "m:"):
+    if data in ("snext", "tnext", "mdone") or data[:2] in ("s:", "t:", "m:"):
         _handle_prefs_callback(cfg, state, cb)
         return
     owner_ok = str((cb.get("from") or {}).get("id")) == cfg.telegram_chat
@@ -2271,6 +2404,7 @@ def run_normal(cfg: Config) -> int:
     dirty = True
 
     now_iso = _now_utc().isoformat()
+    _FETCH_MEMO.clear()  # fresh data each check (shared by same-site sources)
     blocks: dict[str, str] = {}
     statuses: dict[str, list[str]] = {}
     found: dict[str, list | None] = {}
@@ -2316,7 +2450,7 @@ def _send_by_teams(cfg: Config, state: dict, build) -> None:
     recipients with the same teams share one build."""
     groups: dict[tuple, list[str]] = {}
     for cid in _all_chats(cfg):
-        groups.setdefault(tuple(_prefs(cfg, state, cid)["teams"]), []).append(cid)
+        groups.setdefault(tuple(_prefs(cfg, state, cid)["sources"]), []).append(cid)
     for teams, chats in groups.items():
         for msg in build(list(teams)):
             telegram_send(cfg, msg, preview=False, chats=chats)  # no preview cards
