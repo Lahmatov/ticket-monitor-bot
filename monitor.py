@@ -1488,7 +1488,95 @@ def parse_threecket(data, src: "Source") -> list[Event]:
     return events
 
 
+# --------------------------------------------------------------------------- #
+# portugalf1gp.com: official ticket shop of the Formula 1 Grande Prémio de     #
+# Portugal. Its API wants the site's public client token (the same for every  #
+# visitor) plus Origin/Referer. product-categories names the GA & grandstands #
+# event; event-detail/<slug> holds dates, prices and the sale state.          #
+# --------------------------------------------------------------------------- #
+
+F1PT_API = "https://api.portugalf1gp.com/api/v2"
+F1PT_SITE = "https://portugalf1gp.com"
+F1PT_TOKEN = "e9aac1f2f0b6c07d6be070ed14829de684264278359148d6a582ca65a50934d2"
+
+
+def _f1pt_get(path: str) -> dict:
+    raw = fetch(f"{F1PT_API}/{path}", accept="application/json",
+                extra_headers={"token": F1PT_TOKEN, "Authorization": "Bearer",
+                               "Origin": F1PT_SITE, "Referer": F1PT_SITE + "/",
+                               "Content-Type": "application/json"})
+    data = loads_json(raw, None)
+    if not isinstance(data, dict) or data.get("status") != "success":
+        raise RuntimeError(f"portugalf1gp API: {str(data)[:120]}")
+    return data.get("data") or {}
+
+
+def fetch_f1pt(src: "Source") -> str:
+    cats = _f1pt_get("product-categories/moto-grand-prix?lang=en&visible_in=ptgp&page=1")
+    slug = ""
+    for c in cats.get("data") or []:
+        url = str(c.get("url") or "")
+        if c.get("slug") == "ga-grandstands" and url.startswith("events/"):
+            slug = url.split("/", 1)[1]
+    if not slug:  # fall back to this year's / next year's naming
+        slug = src.event_url.format(year=datetime.now(LISBON).year + 1)
+    event = _f1pt_get(f"event-detail/{slug}?lang=en&visible_in=ptgp")
+    return json.dumps({"categories": cats.get("data") or [], "event": event})
+
+
+def parse_f1pt(data, src: "Source") -> list[Event]:
+    """The race weekend as one event. AVAILABLE only on an explicit open
+    signal (checkout enabled / an on-sale status); the site's own status
+    word is shown otherwise, so a change of it reads as a change."""
+    ev = (data or {}).get("event") or {}
+    if not ev:
+        return []
+    status_raw = str(ev.get("status") or "").lower()
+    msg = _norm_ws(BeautifulSoup(str(ev.get("early_bird_message") or ""),
+                                 "html.parser").get_text(" "))
+    msg = re.sub(r"No pre-sale access[^.]*\.\s*", "", msg, flags=re.I).strip()
+    # Everything that might be a sale switch, for the diagnostic log.
+    log.info("[%s] sale fields: %s", src.id, {
+        k: v for k, v in ev.items()
+        if any(w in k.lower() for w in ("sale", "book", "checkout", "status", "open",
+                                        "early_bird_type", "tbc"))})
+    sold_out = status_raw in ("sold_out", "soldout")
+    if ev.get("is_checkout_enabled") is True or status_raw in ("on_sale", "onsale", "live",
+                                                              "active", "open"):
+        status = "AVAILABLE"
+    elif sold_out:
+        status = "SOLD_OUT"
+    else:
+        status = "UNKNOWN"
+    cats = {c.get("slug"): c for c in (data or {}).get("categories") or []}
+    ga = cats.get("ga-grandstands") or {}
+    price = ""
+    try:
+        total = float(ev.get("event_start_price") or 0) + float(ev.get("event_start_price_vat") or 0)
+        price = f"from €{total:.0f}" if total else ""
+    except (TypeError, ValueError):
+        pass
+    notes = [x for x in (price, f"site status: {status_raw}" if status == "UNKNOWN" else "",
+                         msg, (str(ga.get("cta_label") or "").lower() or "")) if x]
+    start = datetime.fromtimestamp(int(ev["start_date_time"]), timezone.utc) \
+        if str(ev.get("start_date_time") or "").isdigit() else None
+    end = datetime.fromtimestamp(int(ev["end_date_time"]), timezone.utc) \
+        if str(ev.get("end_date_time") or "").isdigit() else None
+    when = ""
+    if start and end:
+        when = f"{start.astimezone(LISBON):%d.%m}–{end.astimezone(LISBON):%d.%m.%Y}"
+        if ev.get("tbc"):
+            when += " (TBC)"
+    slug = str(ev.get("slug") or "")
+    title = _norm_ws(str(ev.get("title") or src.team_name)).title()
+    return [Event(slug or "race", title, f"{F1PT_SITE}/en/events/{slug}" if slug else src.url,
+                  when or None, status, title, extra=" · ".join(notes), start=end,
+                  venue="Autódromo Internacional do Algarve, Portimão")]
+
+
 def fetch_source_json(src: "Source") -> str:
+    if src.parser == "f1pt":
+        return fetch_f1pt(src)
     if src.parser == "threecket":
         return fetch_threecket(src)
     if src.parser == "fcporto":
@@ -1510,6 +1598,8 @@ def parse_source_json(data, src: "Source") -> list[Event]:
         return parse_smartfan(data, src)
     if src.parser == "threecket":
         return parse_threecket(data, src)
+    if src.parser == "f1pt":
+        return parse_f1pt(data, src)
     return parse_json_events(data, src)
 
 
@@ -2032,7 +2122,7 @@ def _all_chats(cfg: Config) -> list[str]:
 SPORTS = {"football": "⚽ Football", "futsal": "🥅 Futsal",
           "volleyball": "🏐 Volleyball", "basketball": "🏀 Basketball",
           "handball": "🤾 Handball", "roller_hockey": "🏑 Roller hockey",
-          "tennis": "🎾 Tennis"}
+          "tennis": "🎾 Tennis", "motorsport": "🏎 Formula 1"}
 
 
 def _teams_of(cfg: Config) -> dict[str, "Source"]:

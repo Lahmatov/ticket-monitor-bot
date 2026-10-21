@@ -668,5 +668,20 @@
     "event_url": "millennium-estoril-open-{year}",
     "keywords": [],
     "exclude_keywords": []
+  },
+  {
+    "id": "f1_portugal",
+    "name": "F1 Grande Prémio de Portugal",
+    "emoji": "🏎",
+    "team": "f1_portugal",
+    "team_name": "F1 Grande Prémio de Portugal",
+    "sport": "motorsport",
+    "url": "https://portugalf1gp.com/en",
+    "api_type": "json",
+    "api_url": "https://api.portugalf1gp.com/api/v2",
+    "parser": "f1pt",
+    "event_url": "formula1-portuguese-grand-prix-{year}",
+    "keywords": [],
+    "exclude_keywords": []
   }
 ]
