@@ -1310,9 +1310,81 @@ def loads_json(raw: str, src: "Source"):
         ) from None
 
 
+# --------------------------------------------------------------------------- #
+# smartfan.tickets: ticketing of the volleyball (FPV) and basketball (FPB)    #
+# federations, among many clubs. Its site posts form-encoded operations to    #
+# one proxy endpoint; GetActiveGames lists every game with tickets out.       #
+# --------------------------------------------------------------------------- #
+
+SMARTFAN_BUY_URL = "https://smartfan.tickets/comprar-bilhetes?ev={id}"
+_SMARTFAN_SPORT = {"football": "FOOTBALL", "volleyball": "VOLLEYBALL",
+                   "basketball": "BASKETBALL"}
+
+
+def fetch_smartfan(src: "Source") -> str:
+    return fetch(src.api_url, accept="application/json, text/plain, */*",
+                 form_body={"API": "SalesAPI", "Operation": "GetActiveGames"},
+                 extra_headers={"Origin": "https://smartfan.tickets",
+                                "Referer": "https://smartfan.tickets/home"})
+
+
+def _smartfan_time(value) -> datetime | None:
+    """smartfan dates are Lisbon local time, "23/10/2026 20:30"."""
+    try:
+        return datetime.strptime(str(value or "").strip(),
+                                 "%d/%m/%Y %H:%M").replace(tzinfo=LISBON)
+    except ValueError:
+        return None
+
+
+def parse_smartfan(data, src: "Source") -> list[Event]:
+    """Games of this source's sport where one side is exactly the source's
+    team (e.g. "Portugal"); women's/youth games go via exclude_keywords."""
+    value = (((data or {}).get("ReplyExtraData") or {}).get("Value") or {}) \
+        if isinstance(data, dict) else {}
+    if isinstance(data, dict) and data.get("OpInfoStatus") not in (None, "OK"):
+        raise ValueError(f"smartfan replied {data.get('OpInfoStatus')!r}")
+    want_sport = _SMARTFAN_SPORT.get(src.sport, src.sport.upper())
+    want_team = src.team_name.strip().lower()
+    now = _now_utc()
+    events: list[Event] = []
+    for g in value.get("Games") or []:
+        if not isinstance(g, dict):
+            continue
+        if str((g.get("Sport") or {}).get("Name") or "").upper() != want_sport:
+            continue
+        home = _norm_ws(str((g.get("HomeTeam") or {}).get("Name") or ""))
+        away = _norm_ws(str((g.get("VisitingTeam") or {}).get("Name") or ""))
+        if want_team not in (home.lower(), away.lower()):
+            continue
+        title = " x ".join(t for t in (home, away) if t) or src.team_name
+        comp = _norm_ws(str(g.get("Competition") or ""))
+        start = _smartfan_time(g.get("Date"))
+        sale_start = _smartfan_time(g.get("SaleStartDate"))
+        on_sale = bool(g.get("withHomeTktSales") or g.get("withAwayTktSales"))
+        note = ""
+        if g.get("isSoldOut"):
+            status = "SOLD_OUT"
+        elif sale_start and sale_start > now:
+            status, note = "SOON", _fmt_sale_opens(sale_start)
+        elif on_sale:
+            status = "AVAILABLE"
+        else:
+            status = "SOON"
+        gid = str(g.get("Id") or _event_id("", f"{title}-{g.get('Date', '')}"))
+        extra = " · ".join(x for x in (comp, note) if x)
+        events.append(Event(gid, title, SMARTFAN_BUY_URL.format(id=gid),
+                            start.strftime("%d.%m %H:%M") if start else None,
+                            status, _norm_ws(f"{title} {comp}"), extra=extra,
+                            start=start, venue=_norm_ws(str(g.get("Location") or ""))))
+    return events
+
+
 def fetch_source_json(src: "Source") -> str:
     if src.parser == "fcporto":
         return fetch_fcporto(src)
+    if src.parser == "smartfan":
+        return fetch_smartfan(src)
     return fetch(src.api_url, accept="application/json, text/plain, */*")
 
 
@@ -1324,6 +1396,8 @@ def parse_source_json(data, src: "Source") -> list[Event]:
         return parse_fcporto(data, src)
     if src.parser == "fpf_odata":
         return parse_fpf_odata(data, src)
+    if src.parser == "smartfan":
+        return parse_smartfan(data, src)
     return parse_json_events(data, src)
 
 
