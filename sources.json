@@ -347,5 +347,20 @@
       "cadeira de rodas",
       "wheelchair"
     ]
+  },
+  {
+    "id": "estoril_open",
+    "name": "Millennium Estoril Open",
+    "emoji": "🎾",
+    "team": "estoril_open",
+    "team_name": "Millennium Estoril Open",
+    "sport": "tennis",
+    "url": "https://www.millenniumestorilopen.com/booking",
+    "api_type": "json",
+    "api_url": "https://3cket.com/api/events/",
+    "parser": "threecket",
+    "event_url": "millennium-estoril-open-{year}",
+    "keywords": [],
+    "exclude_keywords": []
   }
 ]

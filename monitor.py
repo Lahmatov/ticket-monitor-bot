@@ -1380,7 +1380,105 @@ def parse_smartfan(data, src: "Source") -> list[Event]:
     return events
 
 
+# --------------------------------------------------------------------------- #
+# 3cket.com: official ticketing of the Millennium Estoril Open. Each edition  #
+# is an event whose alias carries the year; /api/events/<alias> answers 400   #
+# until the organiser creates it. schedule.available_at = sales open.         #
+# --------------------------------------------------------------------------- #
+
+THREECKET_API = "https://3cket.com/api/events/{alias}"
+THREECKET_BUY_URL = "https://3cket.com/pt/event/{alias}"
+_THREECKET_ALIAS_RE = re.compile(r"3cket\.com/(?:[a-z]{2}/)?event/([A-Za-z0-9-]+)")
+
+
+def _threecket_event(alias: str) -> dict | None:
+    """The event's JSON, or None if 3cket has no such event (400/404)."""
+    url = THREECKET_API.format(alias=alias)
+    for attempt in (1, 2):
+        try:
+            resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={
+                "User-Agent": USER_AGENT, "Accept": "application/json"})
+        except requests.RequestException as err:
+            if attempt == 2:
+                raise RuntimeError(f"3cket {alias}: {err}") from err
+            time.sleep(3)
+            continue
+        if resp.status_code in (400, 404):
+            return None  # edition not created yet
+        if resp.status_code == 200:
+            data = loads_json(resp.text, None)
+            return data if isinstance(data, dict) else None
+        if attempt == 2:
+            raise RuntimeError(f"3cket {alias}: HTTP {resp.status_code}")
+        time.sleep(3)
+    return None
+
+
+def fetch_threecket(src: "Source") -> str:
+    """JSON list of this tournament's 3cket editions (this year and next,
+    plus any edition the official site links to)."""
+    aliases: list[str] = []
+    try:  # the official site's "buy" buttons name the current edition
+        aliases += _THREECKET_ALIAS_RE.findall(fetch(src.url))
+    except Exception as err:  # noqa: BLE001 - the 3cket check still works
+        log.warning("[%s] official site unreadable: %s", src.id, err)
+    year = datetime.now(LISBON).year
+    aliases += [src.event_url.format(year=y) for y in (year, year + 1)]
+    seen, events = set(), []
+    for alias in aliases:
+        alias = alias.lower()
+        if alias in seen:
+            continue
+        seen.add(alias)
+        ev = _threecket_event(alias)
+        if ev is not None:
+            events.append(ev)
+    return json.dumps(events)
+
+
+def parse_threecket(data, src: "Source") -> list[Event]:
+    """One Event per published, not-yet-finished edition; if there is none,
+    one "next edition" placeholder (status SOON) so the report shows the
+    tournament is watched and its appearance reads as a change."""
+    now = _now_utc()
+    events: list[Event] = []
+    for ev in data if isinstance(data, list) else []:
+        if str(ev.get("status")) != "published" or str(ev.get("visibility")) != "public":
+            continue
+        sched = ev.get("schedule") or {}
+        start, end = _parse_start(sched.get("start")), _parse_start(sched.get("end"))
+        if end is not None and end < now:
+            continue  # this edition is over
+        opens = _parse_start(sched.get("available_at")) or \
+            _parse_start(ev.get("next_tickets_available_at"))
+        if opens is not None and opens > now:
+            status, note = "SOON", _fmt_sale_opens(opens)
+        else:
+            status, note = "AVAILABLE", ""
+        alias = str(ev.get("alias") or "")
+        when = ""
+        if start and end:
+            s_, e_ = start.astimezone(LISBON), end.astimezone(LISBON)
+            when = f"{s_:%d.%m}–{e_:%d.%m.%Y}"
+        loc = ev.get("location") or {}
+        venue = _norm_ws(str(loc.get("name") or loc.get("title") or "")) \
+            if isinstance(loc, dict) else ""
+        title = _norm_ws(str(ev.get("name") or src.team_name))
+        # start = the last day: the tournament stays listed while it runs
+        events.append(Event(alias or str(ev.get("id")), title,
+                            THREECKET_BUY_URL.format(alias=alias) if alias else src.url,
+                            when or None, status, title, extra=note,
+                            start=end, venue=venue))
+    if not events:
+        events.append(Event("next-edition", f"{src.team_name} (next edition)", src.url,
+                            None, "SOON", src.team_name,
+                            extra="ticket sales not open yet"))
+    return events
+
+
 def fetch_source_json(src: "Source") -> str:
+    if src.parser == "threecket":
+        return fetch_threecket(src)
     if src.parser == "fcporto":
         return fetch_fcporto(src)
     if src.parser == "smartfan":
@@ -1398,6 +1496,8 @@ def parse_source_json(data, src: "Source") -> list[Event]:
         return parse_fpf_odata(data, src)
     if src.parser == "smartfan":
         return parse_smartfan(data, src)
+    if src.parser == "threecket":
+        return parse_threecket(data, src)
     return parse_json_events(data, src)
 
 
@@ -1918,7 +2018,7 @@ def _all_chats(cfg: Config) -> list[str]:
 
 
 SPORTS = {"football": "⚽ Football", "volleyball": "🏐 Volleyball",
-          "basketball": "🏀 Basketball"}
+          "basketball": "🏀 Basketball", "tennis": "🎾 Tennis"}
 
 
 def _teams_of(cfg: Config) -> dict[str, "Source"]:
@@ -2006,7 +2106,7 @@ def _members_keyboard(cfg: Config, teams: list[str], sel: list[str]) -> dict:
 
 _SPORTS_Q = ("⚙️ <b>Which sports do you want ticket alerts for?</b>\n"
              "Tap to select, then press Next.")
-_TEAMS_Q = ("👥 <b>Which teams?</b>\n"
+_TEAMS_Q = ("👥 <b>Which teams / tournaments?</b>\n"
             "Tap to select, then press Next.")
 _MEMBERS_Q = ("🎟 <b>Are you a club member (sócio)?</b>\n"
               "Clubs often sell to members first. Tick the clubs where you're a "
