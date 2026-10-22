@@ -1888,6 +1888,10 @@ def _probe_css(url: str, selector: str) -> None:
 _CHUNK_RE = re.compile(r'["\'(](?:\./|/)?((?:chunk|[a-z0-9\-]+)-[A-Z0-9]{8}\.js)["\')]')
 
 
+# How much text after each hit _probe_grep shows ("term@2000" widens it).
+_PROBE_AFTER = 150
+
+
 def _probe_grep(url: str, terms: str, _seen: set | None = None) -> None:
     """Download url and print context around each occurrence of each term.
 
@@ -1917,7 +1921,7 @@ def _probe_grep(url: str, terms: str, _seen: set | None = None) -> None:
         for term, idxs in found:
             print(f"  [{term}] {len(idxs)} hit(s)")
             for i in idxs[:6]:
-                snippet = body[max(0, i - 150):i + 150].replace("\n", " ")
+                snippet = body[max(0, i - 150):i + _PROBE_AFTER].replace("\n", " ")
                 print("     …", snippet, "…")
     else:
         print(f"  (no hits in {url}, {len(body)} bytes)")
@@ -1965,6 +1969,9 @@ def run_probe(cfg: Config) -> int:
             if grep.startswith("css:"):
                 _probe_css(u, grep[4:])
             elif grep:
+                global _PROBE_AFTER
+                grep, _, width = grep.partition("@")
+                _PROBE_AFTER = int(width) if width.isdigit() else 150
                 _probe_grep(u, grep)
             else:
                 _probe_get(u)
