@@ -52,6 +52,7 @@ import re
 import sys
 import random
 import time
+import unicodedata
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl, urljoin, urlparse
 from zoneinfo import ZoneInfo
@@ -950,14 +951,73 @@ _SPORTING_VENUES = {1: "Estádio José Alvalade, Lisboa",
                     12: "Pavilhão João Rocha, Lisboa"}
 
 
-def _sporting_venue(g: dict) -> str:
-    home = str((g.get("homeTeam") or {}).get("name") or "").upper()
-    if "SPORTING" not in home:
-        return "away game"
-    try:
-        return _SPORTING_VENUES.get(int(g.get("venueId")), "")
-    except (TypeError, ValueError):
-        return ""
+# Away games: tickets.sporting.pt names no stadium (venueId 6 = any away
+# ground). Home grounds of Liga Portugal clubs, keyed by a word of the club's
+# name as Sporting spells it (accents stripped, upper case).
+_PT_CLUB_GROUNDS = {
+    "BENFICA": "Estádio da Luz, Lisboa",
+    "FC PORTO": "Estádio do Dragão, Porto",
+    "BRAGA": "Estádio Municipal de Braga",
+    "VITORIA SC": "Estádio D. Afonso Henriques, Guimarães",
+    "GIL VICENTE": "Estádio Cidade de Barcelos",
+    "FAMALICAO": "Estádio Municipal 22 de Junho, Famalicão",
+    "RIO AVE": "Estádio do Rio Ave FC, Vila do Conde",
+    "ESTORIL": "Estádio António Coimbra da Mota, Estoril",
+    "AROUCA": "Estádio Municipal de Arouca",
+    "SANTA CLARA": "Estádio de São Miguel, Ponta Delgada",
+    "NACIONAL": "Estádio da Madeira, Funchal",
+    "ESTRELA": "Estádio José Gomes, Amadora",
+    "TONDELA": "Estádio João Cardoso, Tondela",
+    "MARITIMO": "Estádio do Marítimo, Funchal",
+    "VISEU": "Estádio do Fontelo, Viseu",
+}
+# Host cities as the sale rules spell them in Portuguese.
+_PT_CITY_EN = {"LONDRES": "London", "MUNIQUE": "Munich", "MILAO": "Milan",
+               "NAPOLES": "Naples", "TURIM": "Turin", "ROMA": "Rome",
+               "VARSOVIA": "Warsaw", "CRACOVIA": "Kraków", "ATENAS": "Athens",
+               "BRUXELAS": "Brussels", "COLONIA": "Cologne", "VIENA": "Vienna",
+               "PRAGA": "Prague", "COPENHAGA": "Copenhagen", "ESTOCOLMO": "Stockholm",
+               "ISTAMBUL": "Istanbul", "MARSELHA": "Marseille", "HAMBURGO": "Hamburg",
+               "GELSENKIRCHEN": "Gelsenkirchen", "LEVERKUSEN": "Leverkusen",
+               "AMESTERDAO": "Amsterdam", "SEVILHA": "Seville", "BARCELONA": "Barcelona",
+               "MADRID": "Madrid", "PARIS": "Paris", "LIVERPOOL": "Liverpool",
+               "MANCHESTER": "Manchester", "GLASGOW": "Glasgow", "DUBLIN": "Dublin"}
+_GROUND_RE = re.compile(r"\b((?:Est[aá]dio|Stadium|Stadion|Stade|Arena|Pavilh[aã]o)"
+                        r"(?:\s+(?:d[aeo]s?|of|de la|du)?\s*[A-ZÀ-Ý][\w'À-ÿ.-]+){1,4})")
+_GROUND_EN_RE = re.compile(r"\b((?:[A-ZÀ-Ý][\w'À-ÿ.-]+\s+){1,3}(?:Stadium|Arena|Stadion))\b")
+_ARRIVAL_RE = re.compile(r"chegada a\s+([A-ZÀ-Ý][\wÀ-ÿ-]+(?:\s+[A-ZÀ-Ý][\wÀ-ÿ-]+)?)")
+
+
+def _fold(text: str) -> str:
+    """Upper case without accents ("Vitória" -> "VITORIA")."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text)
+                   if not unicodedata.combining(c)).upper()
+
+
+def _sporting_venue(g: dict, sport: str = "football") -> str:
+    home = _norm_ws(str((g.get("homeTeam") or {}).get("name") or ""))
+    if "SPORTING" in home.upper():
+        try:
+            return _SPORTING_VENUES.get(int(g.get("venueId")), "")
+        except (TypeError, ValueError):
+            return ""
+    # Away: the sale rules sometimes name the ground or the host city.
+    rules = _norm_ws(BeautifulSoup(str(g.get("accessConditions") or ""),
+                                   "html.parser").get_text(" "))
+    for rx in (_GROUND_EN_RE, _GROUND_RE):  # "Emirates Stadium", "Estádio do X"
+        m = rx.search(rules)
+        if m and "Alvalade" not in m.group(1) and "João Rocha" not in m.group(1):
+            return f"away · {m.group(1)}"
+    m = _ARRIVAL_RE.search(rules)
+    if m:
+        city = m.group(1)
+        return f"away · {_PT_CITY_EN.get(_fold(city), city)}"
+    if sport == "football":
+        folded = f" {_fold(home)} "
+        for key, ground in _PT_CLUB_GROUNDS.items():
+            if f" {key} " in folded:
+                return f"away · {ground}"
+    return "away game"
 
 
 def parse_sporting_api(data, src: "Source", details: dict | None = None) -> list[Event]:
@@ -980,7 +1040,7 @@ def parse_sporting_api(data, src: "Source", details: dict | None = None) -> list
         when = _fmt_iso_datetime(str(g.get("date", "")))
         eid = str(g.get("id") or _event_id("", f"{title}-{g.get('date','')}"))
         url = SPORTING_BUY_URL.format(token=token) if token else (src.browse_url or src.url)
-        venue = _sporting_venue(g)
+        venue = _sporting_venue(g, src.sport)
         context = _norm_ws(f"{title} {comp} {g.get('modality','')}")
         events.append(Event(eid, title, url, when or None, status, context,
                             extra=comp, start=_parse_start(g.get("date")),
