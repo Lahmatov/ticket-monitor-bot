@@ -386,7 +386,7 @@ def should_act(now_lisbon: datetime, state: dict) -> tuple[bool, bool]:
 # Responses already fetched during the current check. Several sources share
 # one site/API (one source per sport), so each URL is downloaded once per
 # check. Cleared at the start of every check; failures are not cached.
-_FETCH_MEMO: dict[tuple, str] = {}
+_FETCH_MEMO: dict[tuple, "str | Exception"] = {}
 
 
 def fetch(url: str, accept: str = "text/html,application/xhtml+xml",
@@ -396,8 +396,15 @@ def fetch(url: str, accept: str = "text/html,application/xhtml+xml",
     key = (url, accept, json.dumps(json_body, sort_keys=True) if json_body else "",
            json.dumps(form_body, sort_keys=True) if form_body else "")
     if key in _FETCH_MEMO:
-        return _FETCH_MEMO[key]
-    text = _fetch_uncached(url, accept, json_body, extra_headers, form_body)
+        hit = _FETCH_MEMO[key]
+        if isinstance(hit, Exception):
+            raise hit  # failed earlier in this check: don't hammer the site again
+        return hit
+    try:
+        text = _fetch_uncached(url, accept, json_body, extra_headers, form_body)
+    except Exception as err:
+        _FETCH_MEMO[key] = err
+        raise
     _FETCH_MEMO[key] = text
     return text
 
@@ -421,6 +428,12 @@ def _fetch_uncached(url: str, accept: str, json_body: dict | None,
                                      timeout=REQUEST_TIMEOUT)
             else:
                 resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            if resp.status_code in (401, 403, 429):
+                body = _norm_ws(resp.text[:400])
+                if any(m in body.lower() for m in _BLOCK_MARKERS + ("forbidden",)):
+                    # A firewall answer: retrying from the same IP won't help.
+                    raise SiteBlockedError(
+                        f"site blocked this server's IP (HTTP {resp.status_code}: {body[:80]})")
             resp.raise_for_status()
             if "charset" not in resp.headers.get("content-type", "").lower():
                 resp.encoding = "utf-8"  # requests would assume ISO-8859-1
@@ -1362,7 +1375,7 @@ def check_unavailable(raw: str) -> None:
 
 _BLOCK_MARKERS = ("ip address has been banned", "access denied", "you have been blocked",
                   "attention required", "cf-browser-verification", "request blocked",
-                  "captcha")
+                  "request was blocked", "captcha")
 
 
 def loads_json(raw: str, src: "Source"):
@@ -2661,6 +2674,20 @@ def _pack_messages(header: str, blocks: list[str]) -> list[str]:
     return messages
 
 
+# A site that keeps blocking GitHub's servers after this long (the loop
+# switches servers meanwhile) is paused and retried every BAN_RETRY_MIN.
+BAN_PAUSE_AFTER_MIN = 60
+BAN_RETRY_MIN = 180
+
+
+def _host(src: "Source") -> str:
+    return urlparse(src.api_url or src.url).netloc.lower()
+
+
+def _host_sources(cfg: Config, host: str) -> list["Source"]:
+    return [s for s in cfg.sources if _host(s) == host]
+
+
 def _process_source(cfg: Config, src: "Source", state: dict,
                     now_iso: str) -> tuple[bool, str, list[str], list | None]:
     """Check one source.
@@ -2670,7 +2697,18 @@ def _process_source(cfg: Config, src: "Source", state: dict,
     """
     notified = state["notified"]
     failures = state["failures"]
+    kinds = state.setdefault("fail_kind", {})
+    blocked = state.setdefault("blocked_hosts", {})
+    host = _host(src)
+    now = _parse_iso(now_iso) or _now_utc()
     dirty = False
+    pause = blocked.get(host) or {}
+    paused_until = _parse_iso(pause.get("paused_until"))
+    if paused_until and now < paused_until:
+        kinds[src.id] = "paused"  # no server switching: every server is blocked
+        block = (f"{_source_heading(src)}\n🚫 the site blocks our servers - next try "
+                 f"{paused_until.astimezone(LISBON):%H:%M}")
+        return False, block, [], None
     try:
         events = load_events(src)
     except Exception as err:  # noqa: BLE001 - handle any failure uniformly
@@ -2678,7 +2716,8 @@ def _process_source(cfg: Config, src: "Source", state: dict,
         failures[src.id] = failures.get(src.id, 0) + 1
         kind = ("maintenance" if isinstance(err, SiteMaintenanceError)
                 else "ban" if isinstance(err, SiteBlockedError) else "error")
-        kinds = state.setdefault("fail_kind", {})
+        if kind == "ban":
+            return True, _handle_ban(cfg, src, state, host, now, err), [], None
         if kind == "maintenance" and kinds.get(src.id) != "maintenance":
             telegram_send(  # owner only, once per maintenance window
                 cfg, f"🛠 <b>{_esc(src.name)}</b>: the ticket site is down for "
@@ -2699,12 +2738,20 @@ def _process_source(cfg: Config, src: "Source", state: dict,
                      f"<i>({why})</i>")
         return True, block, [], None
 
-    if failures.get(src.id):
+    if failures.get(src.id) or kinds.get(src.id):
         failures[src.id] = 0
-        if state.setdefault("fail_kind", {}).pop(src.id, None) == "maintenance":
+        if kinds.pop(src.id, None) == "maintenance":
             telegram_send(cfg, f"✅ <b>{_esc(src.name)}</b>: the ticket site is back "
                                "online.", chats=[cfg.telegram_chat])
         dirty = True
+    gone = blocked.pop(host, None)
+    if gone is not None:
+        dirty = True
+        if gone.get("notified"):
+            names = ", ".join(s.name for s in _host_sources(cfg, host))
+            telegram_send(cfg, f"✅ <b>{_esc(host)}</b> lets us in again - "
+                               f"checks resumed ({_esc(names)}).",
+                          chats=[cfg.telegram_chat])
 
     matched = [e for e in events if matches_keywords(e, src)]
     log.info("[%s] parsed %d events, %d match.", src.id, len(events), len(matched))
@@ -2769,6 +2816,7 @@ def run_normal(cfg: Config) -> int:
 
     now_iso = _now_utc().isoformat()
     _FETCH_MEMO.clear()  # fresh data each check (shared by same-site sources)
+    _ALERTED_HOSTS.clear()
     blocks: dict[str, str] = {}
     statuses: dict[str, list[str]] = {}
     found: dict[str, list | None] = {}
@@ -2882,8 +2930,8 @@ def _should_rotate(state: dict, elapsed_min: float) -> str:
     kinds = state.get("fail_kind") or {}
     for sid, n in (state.get("failures") or {}).items():
         kind = kinds.get(sid, "error")
-        if kind == "maintenance":
-            continue  # the site is down for everyone; a new IP won't help
+        if kind in ("maintenance", "paused"):
+            continue  # down for everyone / blocks every server: a new IP won't help
         if n >= (1 if kind == "ban" else 2):
             return sid
     return ""
@@ -2957,15 +3005,52 @@ def _prune_state(state: dict, now_iso: str) -> bool:
     return changed
 
 
+def _handle_ban(cfg: Config, src: "Source", state: dict, host: str, now: datetime,
+                err: Exception) -> str:
+    """The site's firewall refused us. Meanwhile the loop switches servers;
+    if that hasn't helped for BAN_PAUSE_AFTER_MIN, pause the site and retry
+    every BAN_RETRY_MIN, telling the owner once (per site, not per source)."""
+    kinds = state.setdefault("fail_kind", {})
+    entry = state["blocked_hosts"].setdefault(host, {"since": now.isoformat()})
+    since = _parse_iso(entry.get("since")) or now
+    heading = _source_heading(src)
+    if (now - since).total_seconds() < BAN_PAUSE_AFTER_MIN * 60:
+        kinds[src.id] = "ban"  # -> the loop moves to another server
+        return (f"{heading}\n⚠️ could not read the site <i>(it blocked this GitHub "
+                "server - switching to another one automatically)</i>")
+    retry = now.timestamp() + BAN_RETRY_MIN * 60
+    entry["paused_until"] = datetime.fromtimestamp(retry, timezone.utc).isoformat()
+    for s in _host_sources(cfg, host):
+        kinds[s.id] = "paused"
+    if not entry.get("notified"):
+        entry["notified"] = True
+        names = ", ".join(s.name for s in _host_sources(cfg, host))
+        telegram_send(
+            cfg, f"🚫 <b>{_esc(host)}</b> blocks GitHub's servers (all of them, for "
+                 f"{int((now - since).total_seconds() // 60)} min now): "
+                 f"<i>{_esc(str(err)[:120])}</i>\n"
+                 f"Paused: {_esc(names)}. The bot retries every "
+                 f"{BAN_RETRY_MIN // 60} h and tells you when it works again.",
+            chats=[cfg.telegram_chat])
+    return (f"{heading}\n🚫 the site blocks our servers - next try "
+            f"{datetime.fromtimestamp(retry, LISBON):%H:%M}")
+
+
+_ALERTED_HOSTS: set[str] = set()  # this check: one failure alert per site
+
+
 def _maybe_alert_failure(cfg: Config, src: "Source", n: int, err: Exception) -> None:
+    host = _host(src)
+    if host in _ALERTED_HOSTS:
+        return  # another source on the same site already reported it
+    _ALERTED_HOSTS.add(host)
     if n == FAILURE_ALERT_THRESHOLD or (
         n > FAILURE_ALERT_THRESHOLD and n % FAILURE_REALERT_EVERY == 0
     ):
         telegram_send(  # technical alert: owner only
             cfg,
             f"⚠️ <b>Ticket monitor</b> — {_esc(src.name)}\n"
-            f"Could not read the site {n} checks in a row"
-            f"{' (it is blocking GitHub servers; the bot keeps switching servers)' if isinstance(err, SiteBlockedError) else ''}.\n"
+            f"Could not read the site {n} checks in a row.\n"
             f"<code>{_esc(str(err))[:300]}</code>",
             chats=[cfg.telegram_chat],
         )
