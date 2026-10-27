@@ -251,3 +251,16 @@ TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... python monitor.py --mode test
 без перезапусков; когда сайт снова пускает — «✅ … lets us in again». Источники
 одного сайта (например, футбол и футзал FPF) делят один запрос и одно сообщение.
 
+### Личные окна продаж Sporting (/members)
+
+Sporting продаёт по фазам: Gamebox, Lion Seats, «Sócios há N anos ou mais», затем
+«Todos os Sócios». Бот разбирает график из `accessConditions` каждого матча.
+Пользователь командой `/members` (или после онбординга, если отметил членство
+Sporting) присылает по строке на sócio: имя, год/дата вступления и, если есть,
+`gamebox national` / `gamebox modalidades` / `lion seat`. Для каждого матча бот
+считает, с какого момента может покупать каждый, и шлёт: «🗓 Sporting sale
+windows» (план), «⏰ In 30 min …» и «🟢 Your window is open» — проверка раз в
+минуту, без запросов к сайту. Таким пользователям общий алерт «Members' sale
+open!» по матчам с графиком не приходит. Данные о sócios хранятся только в
+`state.json` (кэш Actions), не в репозитории и не в логах.
+

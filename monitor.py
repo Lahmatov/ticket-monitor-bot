@@ -336,6 +336,9 @@ def load_state(path: str) -> dict:
     data.setdefault("blocked", {})  # chat_id -> {name, since}: removed by the owner
     data.setdefault("prefs", {})  # chat_id -> {teams: [src ids], member: [src ids]}
     data.setdefault("prefs_draft", {})  # chat_id -> same, while onboarding
+    data.setdefault("sale_phases", {})  # "src:game" -> {title, url, phases, ...}
+    data.setdefault("phase_sent", {})  # reminder key -> when sent
+    data.setdefault("awaiting", {})  # chat_id -> "members" while we wait for a reply
     data.setdefault("tg_offset", 0)  # next Telegram update_id to read
     return data
 
@@ -454,7 +457,7 @@ def _fetch_uncached(url: str, accept: str, json_body: dict | None,
 
 class Event:
     __slots__ = ("id", "title", "url", "date", "status", "context", "extra", "start",
-                 "venue")
+                 "venue", "phases")
 
     def __init__(self, id_, title, url, date, status, context, extra="", start=None,
                  venue=""):
@@ -467,6 +470,7 @@ class Event:
         self.extra = extra  # optional secondary line (competition, time, …)
         self.start = start  # aware datetime of kick-off, if known
         self.venue = venue or ""  # stadium, if the site says
+        self.phases: list[dict] = []  # Sporting sale phases (who may buy when)
 
     def __repr__(self) -> str:
         return f"<Event {self.status} {self.title!r} {self.date} {self.url}>"
@@ -1033,6 +1037,139 @@ def _sporting_venue(g: dict, sport: str = "football") -> str:
     return "away game"
 
 
+# --------------------------------------------------------------------------- #
+# Sporting sale phases: the listing's accessConditions spell out who may buy #
+# when ("Sócios há 10 anos ou mais / 29 de Outubro | quinta-feira | 13h00 às #
+# 13h59"). Parsed into phases, then matched against each user's sócios.      #
+# --------------------------------------------------------------------------- #
+
+_PT_MONTHS_FULL = {"janeiro": 1, "fevereiro": 2, "marco": 3, "abril": 4, "maio": 5,
+              "junho": 6, "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10,
+              "novembro": 11, "dezembro": 12}
+_PHASE_LINE_RE = re.compile(
+    r"^(\d{1,2})\s*(?:de\s+)?([A-Za-zçÇ]+)\s*\|[^|]*\|\s*"
+    r"(?:a\s+partir\s+das\s+)?(\d{1,2})h(\d{2})"
+    r"(?:\s*(?:às|as|-)\s*(\d{1,2})h(\d{2})(?:\s*(?:de|do dia)\s+(\d{1,2})\s*(?:de\s+)?([A-Za-zçÇ]+))?)?",
+    re.I)
+
+
+def _sale_month(word: str) -> int:
+    return _PT_MONTHS_FULL.get(_fold(word).lower(), 0)
+
+
+def parse_sale_phases(html: str, game_start: datetime | None = None) -> list[dict]:
+    """[{label, start, end}] from a Sporting accessConditions blob (Lisbon
+    times as ISO strings, end may be None). A phase is a bold label line
+    followed by a "dd Mês | weekday | HHhMM às HHhMM" line."""
+    if not html:
+        return []
+    soup = BeautifulSoup(str(html), "html.parser")
+    lines = [_norm_ws(p.get_text(" ")) for p in soup.find_all(["p", "li"])]
+    lines = [ln for ln in lines if ln] or [_norm_ws(x) for x in soup.get_text("\n").split("\n")]
+    ref = (game_start or _now_utc()).astimezone(LISBON)
+    phases, label = [], ""
+    for ln in lines:
+        m = _PHASE_LINE_RE.match(ln)
+        if not m:
+            if len(ln) < 120 and not ln.lower().startswith(("a compra", "a venda", "-", "*")):
+                label = ln  # candidate label for the next date line
+            continue
+        day, mon = int(m.group(1)), _sale_month(m.group(2))
+        if not mon or not label:
+            continue
+        # The sale happens before the game: pick the year that puts it there.
+        year = ref.year if mon <= ref.month else ref.year - 1
+        try:
+            start = datetime(year, mon, day, int(m.group(3)), int(m.group(4)), tzinfo=LISBON)
+        except ValueError:
+            continue
+        end = None
+        if m.group(5):
+            e_day, e_mon = day, mon
+            if m.group(7) and _sale_month(m.group(8) or ""):
+                e_day, e_mon = int(m.group(7)), _sale_month(m.group(8))
+            try:
+                end = datetime(year, e_mon, e_day, int(m.group(5)), int(m.group(6)), tzinfo=LISBON)
+            except ValueError:
+                end = None
+            if end is not None and end <= start:
+                end = None  # "14h00 às 10h59": runs on into a later day
+        phases.append({"label": label, "start": start.isoformat(),
+                       "end": end.isoformat() if end else None})
+        label = ""
+    return phases
+
+
+def _phase_rules(label: str) -> list[dict]:
+    """A label can list several groups ("Sócios há 75 anos ou mais e Lion
+    Seats sem Gamebox"): one rule per group."""
+    low = _fold(label).lower()
+    rules = []
+    for part in re.split(r"\s+e\s+(?=lion|socios|todos)", low):
+        r = {"all": "todos os socios" in part or ("socios sem gamebox" in part)}
+        m = re.search(r"ha\s+(\d+)\s+anos\s+ou\s+mais", part)
+        r["min_years"] = int(m.group(1)) if m else None
+        m = re.search(r"gamebox\s+(\d+)\s+a\s+(\d+)\s+anos|gamebox\s+(\d+)\s+anos", part)
+        r["gb_years"] = ((int(m.group(1)), int(m.group(2))) if m and m.group(1)
+                         else (int(m.group(3)), 99) if m else None)
+        r["lion"] = "lion seat" in part
+        no_gb = "sem gamebox" in part or "sem gb" in part
+        r["gamebox"] = (None if no_gb else
+                        "national" if "national" in part
+                        else "modalidades" if "modalidades" in part
+                        else "any" if re.search(r"\b(gb|gamebox)\b", part) else None)
+        r["extra"] = "resident" in part or "residentes" in part  # e.g. residents abroad
+        rules.append(r)
+    return rules
+
+
+def _person_years(person: dict, at: datetime) -> float:
+    since = str(person.get("since") or "")
+    try:
+        d = datetime.fromisoformat(since) if len(since) > 4 else datetime(int(since), 7, 1)
+    except ValueError:
+        return 0.0
+    return (at.replace(tzinfo=None) - d.replace(tzinfo=None)).days / 365.25
+
+
+def person_qualifies(label: str, person: dict, at: datetime) -> bool:
+    gb = str(person.get("gamebox") or "")
+    years = _person_years(person, at)
+    for r in _phase_rules(label):
+        if r["extra"]:
+            continue  # extra conditions we can't know (residence abroad...)
+        gb_ok = None  # does the person meet this group's Gamebox condition?
+        if r["gamebox"]:
+            gb_ok = bool(gb) and (r["gamebox"] == "any" or r["gamebox"] in gb) and (
+                r["gb_years"] is None or r["gb_years"][0] <= years <= r["gb_years"][1])
+        if r["lion"]:
+            if person.get("lion") and gb_ok is not False:
+                return True
+            continue  # a Lion Seats group: nobody else
+        if gb_ok:
+            return True
+        if r["gamebox"]:
+            continue
+        if r["min_years"] is not None:
+            if years >= r["min_years"]:
+                return True
+            continue
+        if r["all"]:
+            return True
+    return False
+
+
+def person_window(phases: list[dict], person: dict, now: datetime) -> dict | None:
+    """The earliest phase this sócio may buy in that hasn't ended yet."""
+    for ph in sorted(phases, key=lambda p: p["start"]):
+        end = _parse_iso(ph.get("end"))
+        if end is not None and end < now:
+            continue
+        if person_qualifies(ph["label"], person, _parse_iso(ph["start"]) or now):
+            return ph
+    return None
+
+
 def parse_sporting_api(data, src: "Source", details: dict | None = None) -> list[Event]:
     """Parse tickets.sporting.pt allopengames JSON (+ per-game page data)."""
     details = details or {}
@@ -1055,9 +1192,10 @@ def parse_sporting_api(data, src: "Source", details: dict | None = None) -> list
         url = SPORTING_BUY_URL.format(token=token) if token else (src.browse_url or src.url)
         venue = _sporting_venue(g, src.sport)
         context = _norm_ws(f"{title} {comp} {g.get('modality','')}")
-        events.append(Event(eid, title, url, when or None, status, context,
-                            extra=comp, start=_parse_start(g.get("date")),
-                            venue=venue))
+        ev = Event(eid, title, url, when or None, status, context,
+                   extra=comp, start=_parse_start(g.get("date")), venue=venue)
+        ev.phases = parse_sale_phases(g.get("accessConditions"), ev.start)
+        events.append(ev)
     return events
 
 
@@ -1859,6 +1997,9 @@ def run_diagnostic(cfg: Config, dump_file: str | None) -> int:
                 star = "  (already played -> hidden)"
             print(f"[{ev.status:9}] {ev.title[:70]!r} | {ev.date} | {ev.extra} | "
                   f"{ev.venue or '-'} | {ev.url}{star}")
+            for ph in ev.phases:
+                print(f"      phase {ph['start'][5:16]} -> {(ph['end'] or '')[5:16] or '…':11} "
+                      f"| {ph['label']}")
         matched = [e for e in upcoming if matches_keywords(e, src)]
         kw = src.keywords or "(all events)"
         print(f"\nKeywords {kw}: {len(matched)} match; "
@@ -2310,7 +2451,8 @@ def _start_onboarding(cfg: Config, state: dict, cid: str, fresh: bool = False) -
 
 def _finish_onboarding(cfg: Config, state: dict, cid: str, draft: dict,
                        message_id) -> None:
-    state["prefs"][cid] = {k: draft[k] for k in ("sports", "teams", "member")}
+    state["prefs"][cid] = {**(state["prefs"].get(cid) or {}),
+                           **{k: draft[k] for k in ("sports", "teams", "member")}}
     state["prefs_draft"].pop(cid, None)
     teams = _teams_of(cfg)
     names = lambda ids: ", ".join(_team_label(teams[t]) for t in teams  # noqa: E731
@@ -2326,6 +2468,8 @@ def _finish_onboarding(cfg: Config, state: dict, cid: str, draft: dict,
     else:
         _tg(cfg, "sendMessage", chat_id=cid, parse_mode="HTML", text=text)
     _send_status(cfg, state, cid)
+    if "sporting" in draft["member"] and not _members_of(state, cid):
+        _ask_members(cfg, state, cid)
 
 
 def _handle_prefs_callback(cfg: Config, state: dict, cb: dict) -> None:
@@ -2425,8 +2569,17 @@ def _handle_message(cfg: Config, state: dict, msg: dict) -> None:
     if chat.get("type") != "private":
         return  # requests only from private chats
     cid, name = str(chat.get("id")), _chat_name(chat)
-    text = (msg.get("text") or "").strip().lower()
+    raw_text = (msg.get("text") or "").strip()
+    text = raw_text.lower()
     say = lambda t: _tg(cfg, "sendMessage", chat_id=cid, text=t)  # noqa: E731
+    known = cid in cfg.telegram_chats or cid in state["subscribers"]
+    if known and text == "/members":
+        _ask_members(cfg, state, cid)
+        return
+    if known and raw_text and not raw_text.startswith("/") and \
+            state.setdefault("awaiting", {}).get(cid) == "members":
+        _handle_members_reply(cfg, state, cid, raw_text)
+        return
     if text == "/status" and (cid in cfg.telegram_chats or cid in state["subscribers"]):
         _send_status(cfg, state, cid)
         return
@@ -2490,6 +2643,196 @@ def _send_status(cfg: Config, state: dict, cid: str) -> None:
         return
     for msg in summary:
         telegram_send(cfg, msg, preview=False, chats=[cid])
+    if _members_of(state, cid):
+        plan = _windows_text(cfg, state, cid, _now_utc())
+        if plan:
+            telegram_send(cfg, plan, preview=False, chats=[cid])
+
+
+# --------------------------------------------------------------------------- #
+# Personal Sporting sale windows: each user lists their sócios (/members);   #
+# for every game with a phased sale the bot works out when each of them may  #
+# buy and reminds them 30 min before and when their window opens.            #
+# --------------------------------------------------------------------------- #
+
+REMIND_BEFORE_MIN = 30
+_MEMBERS_HELP = (
+    "🦁 <b>Your Sporting sócios</b>\n"
+    "Sporting sells in phases by seniority (\"Sócios há 10 anos ou mais\"...), "
+    "Gamebox and Lion Seats. Tell me who buys and I'll tell each of you when "
+    "your window opens.\n\n"
+    "Reply with one line per sócio: <b>name</b>, the <b>year</b> (or date) they "
+    "became a sócio, and if it applies <i>gamebox national</i>, "
+    "<i>gamebox modalidades</i> or <i>lion seat</i>. Example:\n"
+    "<code>Me 2024\nSon 2026-08\nDad 1995 gamebox national</code>\n\n"
+    "Send <code>none</code> to clear the list.")
+_MEMBER_LINE_RE = re.compile(
+    r"^(?P<name>.+?)[\s,:;-]+(?P<since>\d{4}(?:-\d{1,2}(?:-\d{1,2})?)?|\d{1,2}[./]\d{1,2}[./]\d{4}"
+    r"|\d{1,2}[./]\d{4})\b(?P<rest>.*)$")
+
+
+def _members_of(state: dict, cid: str) -> list[dict]:
+    return list(((state.get("prefs") or {}).get(cid) or {}).get("sporting_members") or [])
+
+
+def _ask_members(cfg: Config, state: dict, cid: str) -> None:
+    state.setdefault("awaiting", {})[cid] = "members"
+    have = _members_of(state, cid)
+    now_list = ("\n\nNow: " + "; ".join(_member_str(p) for p in have)) if have else ""
+    _tg(cfg, "sendMessage", chat_id=cid, parse_mode="HTML", text=_MEMBERS_HELP + now_list)
+
+
+def _member_str(p: dict) -> str:
+    extra = [x for x in (f"gamebox {p['gamebox']}" if p.get("gamebox") else "",
+                         "lion seat" if p.get("lion") else "") if x]
+    return f"{p['name']} (since {p['since']}{', ' + ', '.join(extra) if extra else ''})"
+
+
+def parse_members(text: str) -> list[dict] | None:
+    """Lines "Name 2024 [gamebox national|modalidades] [lion seat]" -> list;
+    None if a line can't be read."""
+    out = []
+    for raw in text.splitlines():
+        line = _norm_ws(raw)
+        if not line:
+            continue
+        m = _MEMBER_LINE_RE.match(line)
+        if not m:
+            return None
+        since = m.group("since")
+        d = re.match(r"^(\d{1,2})[./](\d{1,2})[./](\d{4})$", since)
+        if d:
+            since = f"{d.group(3)}-{int(d.group(2)):02d}-{int(d.group(1)):02d}"
+        d = re.match(r"^(\d{1,2})[./](\d{4})$", since)
+        if d:
+            since = f"{d.group(2)}-{int(d.group(1)):02d}"
+        if re.match(r"^\d{4}-\d{1,2}$", since):
+            y, mo = since.split("-")
+            since = f"{y}-{int(mo):02d}-01"
+        year = int(since[:4])
+        if not 1900 <= year <= datetime.now(LISBON).year:
+            return None
+        rest = _fold(m.group("rest")).lower()
+        gb = ("national" if "national" in rest and ("gamebox" in rest or "gb" in rest)
+              else "modalidades" if "modalidades" in rest else
+              "any" if re.search(r"\b(gamebox|gb)\b", rest) else "")
+        out.append({"name": m.group("name").strip()[:30], "since": since,
+                    "gamebox": gb, "lion": "lion" in rest})
+    return out
+
+
+def _handle_members_reply(cfg: Config, state: dict, cid: str, raw: str) -> None:
+    say = lambda t: _tg(cfg, "sendMessage", chat_id=cid, parse_mode="HTML", text=t)  # noqa: E731
+    prefs = state.setdefault("prefs", {}).setdefault(cid, {})
+    if _norm_ws(raw).lower() in ("none", "no", "нет", "clear"):
+        prefs.pop("sporting_members", None)
+        state["awaiting"].pop(cid, None)
+        say("OK, no Sporting sócios saved. /members to set them again.")
+        return
+    people = parse_members(raw)
+    if not people:
+        say("I couldn't read that. One line per sócio, e.g. <code>Me 2024</code> "
+            "or <code>Son 2026-08</code>. Try again or send <code>none</code>.")
+        return
+    prefs["sporting_members"] = people
+    state["awaiting"].pop(cid, None)
+    lines = ["✅ Saved: " + "; ".join(_member_str(p) for p in people)]
+    plan = _windows_text(cfg, state, cid, _now_utc())
+    lines.append(plan or "No Sporting game with a phased sale right now - I'll tell "
+                         "you each person's window as soon as one is announced.")
+    say("\n\n".join(lines))
+
+
+def _fmt_when(iso: str) -> str:
+    d = _parse_iso(iso)
+    return f"{d.astimezone(LISBON):%a %d %b, %H:%M}" if d else "?"
+
+
+def _user_games(cfg: Config, state: dict, cid: str) -> list[tuple[str, dict]]:
+    srcs = set(_prefs(cfg, state, cid)["sources"])
+    games = state.get("sale_phases") or {}
+    return [(k, g) for k, g in games.items() if g.get("source") in srcs and g.get("phases")]
+
+
+def _windows_text(cfg: Config, state: dict, cid: str, now: datetime) -> str:
+    """Per game: when each of the user's sócios may buy (future windows only)."""
+    people = _members_of(state, cid)
+    blocks = []
+    for _key, g in sorted(_user_games(cfg, state, cid), key=lambda kv: kv[1].get("start") or ""):
+        rows = []
+        for p in people:
+            w = person_window(g["phases"], p, now)
+            if w is None:
+                rows.append(f"• {_esc(p['name'])}: no phase matches - check the rules")
+            else:
+                started = (_parse_iso(w["start"]) or now) <= now
+                rows.append(f"• {_esc(p['name'])}: {'open now' if started else _fmt_when(w['start'])}"
+                            f" <i>({_esc(w['label'])})</i>")
+        if rows:
+            link = f'<a href="{_esc(g["url"])}">{_esc(g["title"])}</a>'
+            blocks.append(f"{link} · {_esc(g.get('date') or '')}\n" + "\n".join(rows))
+    if not blocks:
+        return ""
+    return "🗓 <b>Your Sporting sale windows</b>\n\n" + "\n\n".join(blocks)
+
+
+def sale_window_reminders(cfg: Config, state: dict, now: datetime) -> bool:
+    """Plan / 30-min / opening messages per user and game. Cheap (no
+    fetching), so it runs every loop tick. True if anything was sent."""
+    sent_any = False
+    sent = state.setdefault("phase_sent", {})
+    snapshot = state.get("snapshot") or {}
+    for cid in _all_chats(cfg):
+        people = _members_of(state, cid)
+        if not people or "sporting" not in _prefs(cfg, state, cid)["member"]:
+            continue
+        for key, g in _user_games(cfg, state, cid):
+            src_id, _, gid = key.partition(":")
+            if (snapshot.get(src_id) or {}).get(gid) == "SOLD_OUT":
+                continue
+            by_start: dict[str, list[str]] = {}
+            labels: dict[str, str] = {}
+            for p in people:
+                w = person_window(g["phases"], p, now)
+                if w:
+                    by_start.setdefault(w["start"], []).append(p["name"])
+                    labels[w["start"]] = w["label"]
+            if not by_start:
+                continue
+            link = f'<a href="{_esc(g["url"])}">{_esc(g["title"])}</a> · {_esc(g.get("date") or "")}'
+            plan_key = f"plan:{cid}:{key}"
+            if plan_key not in sent and any((_parse_iso(st) or now) > now for st in by_start):
+                rows = [f"• {_esc(', '.join(names))}: {_fmt_when(st)} <i>({_esc(labels[st])})</i>"
+                        for st, names in sorted(by_start.items())]
+                if telegram_send(cfg, "🗓 <b>Sporting sale windows</b> — " + link + "\n"
+                                 + "\n".join(rows) + f"\n\nI'll remind you {REMIND_BEFORE_MIN} "
+                                 "min before and when each window opens.",
+                                 preview=False, chats=[cid]):
+                    sent[plan_key] = now.isoformat()
+                    sent_any = True
+            for st, names in by_start.items():
+                start = _parse_iso(st)
+                if start is None:
+                    continue
+                who = _esc(" & ".join(names))
+                mins = (start - now).total_seconds() / 60
+                k_soon, k_open = f"soon:{cid}:{key}:{st}", f"open:{cid}:{key}:{st}"
+                if 0 < mins <= REMIND_BEFORE_MIN and k_soon not in sent:
+                    if telegram_send(cfg, f"⏰ <b>In {int(round(mins))} min</b> {who} can buy — "
+                                     f"{link}\n<i>{_esc(labels[st])}</i>, from "
+                                     f"{start.astimezone(LISBON):%H:%M}. Log in to "
+                                     "tickets.sporting.pt now.", preview=False, chats=[cid]):
+                        sent[k_soon] = now.isoformat()
+                        sent_any = True
+                if -90 <= mins <= 0 and k_open not in sent:
+                    if telegram_send(cfg, f"🟢 <b>Your window is open</b>: {who} can buy now — "
+                                     f"{link}\n<i>{_esc(labels[st])}</i>\n\n"
+                                     f'🔗 <a href="{_esc(g["url"])}">Buy tickets</a>',
+                                     preview=False, chats=[cid]):
+                        sent[k_open] = now.isoformat()
+                        sent[k_soon] = sent.get(k_soon) or now.isoformat()
+                        sent_any = True
+    return sent_any
 
 
 def _handle_callback(cfg: Config, state: dict, cb: dict) -> None:
@@ -2756,8 +3099,17 @@ def _process_source(cfg: Config, src: "Source", state: dict,
     matched = [e for e in events if matches_keywords(e, src)]
     log.info("[%s] parsed %d events, %d match.", src.id, len(events), len(matched))
 
+    phases_store = state.setdefault("sale_phases", {})
     for ev in matched:
         key = f"{src.id}:{ev.id}"
+        if ev.phases:  # who may buy when: for the personal sale windows
+            phases_store[key] = {"source": src.id, "title": ev.title, "url": ev.url,
+                                 "date": ev.date or "", "phases": ev.phases,
+                                 "start": ev.start.isoformat() if ev.start else None}
+            dirty = True
+        elif key in phases_store:
+            del phases_store[key]
+            dirty = True
         entry = notified.get(key)
         # "level" = the sale phase already alerted; entries from before
         # members alerts existed have none and were public alerts.
@@ -2774,6 +3126,9 @@ def _process_source(cfg: Config, src: "Source", state: dict,
                 continue
             # Members-only sales: only users who said they're members there.
             chats = _recipients(cfg, state, src.id, members=ev.status == "MEMBERS")
+            if ev.status == "MEMBERS" and ev.phases:
+                # Users who listed their sócios get their own window instead.
+                chats = [c for c in chats if not _members_of(state, c)]
             if not chats or telegram_send(
                     cfg, format_notification(ev, src.name, ev.status == "MEMBERS"),
                     chats=chats):
@@ -2805,6 +3160,12 @@ def run_normal(cfg: Config) -> int:
         log.exception("Access-request polling failed.")
     state = load_state(cfg.state_file)
     cfg.subscribers = list(state["subscribers"])
+    try:  # personal sale-window reminders: every tick, minute-accurate
+        if sale_window_reminders(cfg, state, _now_utc()):
+            save_state(cfg.state_file, state)
+            set_output("state_changed", "true")
+    except Exception:  # noqa: BLE001 - never let reminders stop a check
+        log.exception("Sale-window reminders failed.")
     now_lisbon = datetime.now(LISBON)
     act, _is_night = should_act(now_lisbon, state)
     if not act:
@@ -2952,6 +3313,7 @@ def run_loop(cfg: Config, minutes: float) -> int:
         _tg(cfg, "setMyCommands", commands=[
             {"command": "status", "description": "Current ticket overview"},
             {"command": "settings", "description": "Choose teams / membership"},
+            {"command": "members", "description": "Your Sporting sócios (sale windows)"},
             {"command": "start", "description": "Subscribe to ticket alerts"},
             {"command": "stop", "description": "Stop receiving messages"}])
     while True:
@@ -3001,6 +3363,16 @@ def _prune_state(state: dict, now_iso: str) -> bool:
             continue
         if (now - last_seen).total_seconds() > FORGET_AFTER_DAYS * 86400:
             del state["notified"][eid]
+            changed = True
+    for key, g in list((state.get("sale_phases") or {}).items()):
+        start = _parse_iso(g.get("start"))
+        if start is not None and (now - start).total_seconds() > 86400:
+            del state["sale_phases"][key]  # game played
+            changed = True
+    for key, when in list((state.get("phase_sent") or {}).items()):
+        t = _parse_iso(when)
+        if t is not None and (now - t).total_seconds() > 30 * 86400:
+            del state["phase_sent"][key]
             changed = True
     return changed
 
