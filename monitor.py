@@ -3177,7 +3177,12 @@ def _process_source(cfg: Config, src: "Source", state: dict,
     gone = blocked.pop(host, None)
     if gone is not None:
         dirty = True
-        if gone.get("notified"):
+        if gone.get("moved") and not gone.get("notified"):
+            names = ", ".join(s.name for s in _host_sources(cfg, host))
+            telegram_send(cfg, f"✅ <b>{_esc(host)}</b> works from this computer - "
+                               f"checking again ({_esc(names)}).",
+                          chats=[cfg.telegram_chat])
+        elif gone.get("notified"):
             names = ", ".join(s.name for s in _host_sources(cfg, host))
             telegram_send(cfg, f"✅ <b>{_esc(host)}</b> lets us in again - "
                                f"checks resumed ({_esc(names)}).",
@@ -3248,6 +3253,8 @@ def run_normal(cfg: Config) -> int:
         log.exception("Access-request polling failed.")
     state = load_state(cfg.state_file)
     cfg.subscribers = list(state["subscribers"])
+    if _forget_foreign_bans(state):
+        save_state(cfg.state_file, state)
     try:  # personal sale-window reminders: every tick, minute-accurate
         if sale_window_reminders(cfg, state, _now_utc()):
             save_state(cfg.state_file, state)
@@ -3467,16 +3474,40 @@ def _prune_state(state: dict, now_iso: str) -> bool:
     return changed
 
 
+def _ban_origin() -> str:
+    return "local" if os.environ.get("LOCAL_RUN") else "github"
+
+
+def _forget_foreign_bans(state: dict) -> bool:
+    """A site that blocked GitHub's servers may well let the owner's own
+    computer in: on moving machines, reset bans recorded elsewhere so the
+    new IP is tried at once instead of after the pause."""
+    blocked = state.get("blocked_hosts") or {}
+    foreign = [h for h, e in blocked.items() if e.get("where", "github") != _ban_origin()]
+    now = _now_utc().isoformat()
+    for host in foreign:  # "moved": tell the owner how the first try here goes
+        blocked[host] = {"since": now, "where": _ban_origin(), "moved": True}
+    if foreign:
+        kinds = state.setdefault("fail_kind", {})
+        for sid in [sid for sid, k in kinds.items() if k in ("ban", "paused")]:
+            del kinds[sid]
+        log.info("Forgot site bans recorded on another machine: %s", ", ".join(foreign))
+    return bool(foreign)
+
+
 def _handle_ban(cfg: Config, src: "Source", state: dict, host: str, now: datetime,
                 err: Exception) -> str:
     """The site's firewall refused us. Meanwhile the loop switches servers;
     if that hasn't helped for BAN_PAUSE_AFTER_MIN, pause the site and retry
-    every BAN_RETRY_MIN, telling the owner once (per site, not per source)."""
+    every BAN_RETRY_MIN, telling the owner once (per site, not per source).
+    On the owner's own computer there is no other server: pause at once."""
     kinds = state.setdefault("fail_kind", {})
-    entry = state["blocked_hosts"].setdefault(host, {"since": now.isoformat()})
+    local = bool(os.environ.get("LOCAL_RUN"))
+    entry = state["blocked_hosts"].setdefault(
+        host, {"since": now.isoformat(), "where": _ban_origin()})
     since = _parse_iso(entry.get("since")) or now
     heading = _source_heading(src)
-    if (now - since).total_seconds() < BAN_PAUSE_AFTER_MIN * 60:
+    if not local and (now - since).total_seconds() < BAN_PAUSE_AFTER_MIN * 60:
         kinds[src.id] = "ban"  # -> the loop moves to another server
         return (f"{heading}\n⚠️ could not read the site <i>(it blocked this GitHub "
                 "server - switching to another one automatically)</i>")
@@ -3487,9 +3518,11 @@ def _handle_ban(cfg: Config, src: "Source", state: dict, host: str, now: datetim
     if not entry.get("notified"):
         entry["notified"] = True
         names = ", ".join(s.name for s in _host_sources(cfg, host))
+        who = ("this computer's internet connection" if local else
+               f"GitHub's servers (all of them, for "
+               f"{int((now - since).total_seconds() // 60)} min now)")
         telegram_send(
-            cfg, f"🚫 <b>{_esc(host)}</b> blocks GitHub's servers (all of them, for "
-                 f"{int((now - since).total_seconds() // 60)} min now): "
+            cfg, f"🚫 <b>{_esc(host)}</b> blocks {who}: "
                  f"<i>{_esc(str(err)[:120])}</i>\n"
                  f"Paused: {_esc(names)}. The bot retries every "
                  f"{BAN_RETRY_MIN // 60} h and tells you when it works again.",
