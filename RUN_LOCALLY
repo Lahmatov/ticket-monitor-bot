@@ -1,0 +1,2 @@
+The bot runs on the owner's Mac (tools/macos). While this file exists the
+GitHub workflow does not loop. Delete it to move the bot back to GitHub.
