@@ -264,3 +264,28 @@ windows» (план), «⏰ In 30 min …» и «🟢 Your window is open» — 
 open!» по матчам с графиком не приходит. Данные о sócios хранятся только в
 `state.json` (кэш Actions), не в репозитории и не в логах.
 
+### Запуск на своём Mac вместо GitHub
+
+Зачем: сайты вроде FPF блокируют серверы GitHub, а домашний адрес — нет.
+
+1. Владелец запускает workflow в режиме `export`: бот присылает владельцу в
+   Telegram файлы `state.json` (подписчики, настройки, /members, уже отправленные
+   алерты) и `bot.env` (токен и chat id — хранить в тайне). Сохранить оба в
+   «Загрузки».
+2. В корень репозитория коммитится пустой файл `RUN_LOCALLY`: с ним цикл на GitHub
+   сразу завершается и не запускает следующий (бот не работает в двух местах).
+3. На Mac (Python 3.10+, например с python.org):
+   ```
+   cd ~ && git clone https://github.com/Lahmatov/ticket-monitor-bot.git
+   cd ticket-monitor-bot && bash tools/macos/install.sh
+   ```
+   Скрипт ставит библиотеки в `.venv`, берёт `bot.env`/`state.json` из «Загрузок»,
+   шлёт тестовое сообщение и регистрирует службу launchd (`com.ticket-monitor.bot`):
+   стартует при входе, перезапускается при сбое, `caffeinate` не даёт Mac уснуть,
+   пока бот работает (крышку ноутбука держать открытой или с внешним монитором,
+   питание от сети). Лог: `~/Library/Logs/ticket-monitor.log`.
+   Обновить код: `bash tools/macos/update.sh`; убрать: `bash tools/macos/uninstall.sh`.
+   Папку не класть в Documents/Desktop/Downloads — macOS не даёт службам туда доступ.
+4. Вернуть на GitHub: удалить `RUN_LOCALLY`, на Mac — `uninstall.sh`, запустить
+   workflow в режиме `normal` (state при этом — из кэша Actions на момент переезда).
+

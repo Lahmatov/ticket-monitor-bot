@@ -4,3 +4,7 @@ state.json.tmp
 *-page.html
 __pycache__/
 *.pyc
+
+# Running on your own computer (tools/macos)
+.env
+.venv/

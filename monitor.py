@@ -457,7 +457,7 @@ def _fetch_uncached(url: str, accept: str, json_body: dict | None,
 
 class Event:
     __slots__ = ("id", "title", "url", "date", "status", "context", "extra", "start",
-                 "venue", "phases")
+                 "venue", "phases", "_cutoff")
 
     def __init__(self, id_, title, url, date, status, context, extra="", start=None,
                  venue=""):
@@ -471,6 +471,7 @@ class Event:
         self.start = start  # aware datetime of kick-off, if known
         self.venue = venue or ""  # stadium, if the site says
         self.phases: list[dict] = []  # Sporting sale phases (who may buy when)
+        self._cutoff: str | None = None  # sócios must have joined before this day
 
     def __repr__(self) -> str:
         return f"<Event {self.status} {self.title!r} {self.date} {self.url}>"
@@ -1100,6 +1101,41 @@ def parse_sale_phases(html: str, game_start: datetime | None = None) -> list[dic
     return phases
 
 
+_ADMISSION_RE = re.compile(r"data\s+de\s+admiss[aã]o\s*:?\s*anterior\s+a\s+(\d{1,2})\s+de\s+"
+                           r"([A-Za-zçÇ]+)\s+de\s+(\d{4})", re.I)
+
+
+def parse_admission_cutoff(html: str) -> str | None:
+    """"Data de Admissão: anterior a 25 de Agosto de 2026" -> "2026-08-25"."""
+    text = _norm_ws(BeautifulSoup(str(html or ""), "html.parser").get_text(" "))
+    m = _ADMISSION_RE.search(text)
+    if not m or not _sale_month(m.group(2)):
+        return None
+    return f"{m.group(3)}-{_sale_month(m.group(2)):02d}-{int(m.group(1)):02d}"
+
+
+def admission_ok(person: dict, cutoff: str | None) -> bool | None:
+    """True/False if the sócio joined before the cutoff; None when only the
+    year/month is known and it is the cutoff's."""
+    if not cutoff:
+        return True
+    since = str(person.get("since") or "")
+    parts = [int(x) for x in re.findall(r"\d+", since)][:3]
+    cut = [int(x) for x in cutoff.split("-")]
+    if not parts:
+        return None
+    if len(parts) >= 3:
+        return parts[:3] < cut
+    if parts[:len(parts)] != cut[:len(parts)]:
+        return parts < cut[:len(parts)]
+    return None
+
+
+def _fmt_day(iso: str) -> str:
+    y, m, d = (int(x) for x in iso.split("-"))
+    return f"{d} {datetime(y, m, d):%b %Y}"
+
+
 def _phase_rules(label: str) -> list[dict]:
     """A label can list several groups ("Sócios há 75 anos ou mais e Lion
     Seats sem Gamebox"): one rule per group."""
@@ -1126,7 +1162,10 @@ def _phase_rules(label: str) -> list[dict]:
 def _person_years(person: dict, at: datetime) -> float:
     since = str(person.get("since") or "")
     try:
-        d = datetime.fromisoformat(since) if len(since) > 4 else datetime(int(since), 7, 1)
+        if len(since) == 7:  # "2026-08"
+            d = datetime(int(since[:4]), int(since[5:7]), 15)
+        else:
+            d = datetime.fromisoformat(since) if len(since) > 4 else datetime(int(since), 7, 1)
     except ValueError:
         return 0.0
     return (at.replace(tzinfo=None) - d.replace(tzinfo=None)).days / 365.25
@@ -1195,6 +1234,7 @@ def parse_sporting_api(data, src: "Source", details: dict | None = None) -> list
         ev = Event(eid, title, url, when or None, status, context,
                    extra=comp, start=_parse_start(g.get("date")), venue=venue)
         ev.phases = parse_sale_phases(g.get("accessConditions"), ev.start)
+        ev._cutoff = parse_admission_cutoff(g.get("accessConditions")) if ev.phases else None
         events.append(ev)
     return events
 
@@ -2708,7 +2748,7 @@ def parse_members(text: str) -> list[dict] | None:
             since = f"{d.group(2)}-{int(d.group(1)):02d}"
         if re.match(r"^\d{4}-\d{1,2}$", since):
             y, mo = since.split("-")
-            since = f"{y}-{int(mo):02d}-01"
+            since = f"{y}-{int(mo):02d}"  # month only: kept, so cutoffs can say "unsure"
         year = int(since[:4])
         if not 1900 <= year <= datetime.now(LISBON).year:
             return None
@@ -2760,14 +2800,21 @@ def _windows_text(cfg: Config, state: dict, cid: str, now: datetime) -> str:
     blocks = []
     for _key, g in sorted(_user_games(cfg, state, cid), key=lambda kv: kv[1].get("start") or ""):
         rows = []
+        cutoff = g.get("admitted_before")
         for p in people:
+            ok = admission_ok(p, cutoff)
+            if ok is False:
+                rows.append(f"• {_esc(p['name'])}: ❌ not eligible - must have joined "
+                            f"before {_fmt_day(cutoff)}")
+                continue
             w = person_window(g["phases"], p, now)
             if w is None:
                 rows.append(f"• {_esc(p['name'])}: no phase matches - check the rules")
             else:
                 started = (_parse_iso(w["start"]) or now) <= now
                 rows.append(f"• {_esc(p['name'])}: {'open now' if started else _fmt_when(w['start'])}"
-                            f" <i>({_esc(w['label'])})</i>")
+                            f" <i>({_esc(w['label'])})</i>"
+                            + (f" ⚠️ only if joined before {_fmt_day(cutoff)}" if ok is None else ""))
         if rows:
             link = f'<a href="{_esc(g["url"])}">{_esc(g["title"])}</a>'
             blocks.append(f"{link} · {_esc(g.get('date') or '')}\n" + "\n".join(rows))
@@ -2792,10 +2839,15 @@ def sale_window_reminders(cfg: Config, state: dict, now: datetime) -> bool:
                 continue
             by_start: dict[str, list[str]] = {}
             labels: dict[str, str] = {}
+            cutoff = g.get("admitted_before")
             for p in people:
+                ok = admission_ok(p, cutoff)
+                if ok is False:
+                    continue  # joined too late for this game
                 w = person_window(g["phases"], p, now)
                 if w:
-                    by_start.setdefault(w["start"], []).append(p["name"])
+                    by_start.setdefault(w["start"], []).append(
+                        p["name"] + ("*" if ok is None else ""))
                     labels[w["start"]] = w["label"]
             if not by_start:
                 continue
@@ -2804,8 +2856,11 @@ def sale_window_reminders(cfg: Config, state: dict, now: datetime) -> bool:
             if plan_key not in sent and any((_parse_iso(st) or now) > now for st in by_start):
                 rows = [f"• {_esc(', '.join(names))}: {_fmt_when(st)} <i>({_esc(labels[st])})</i>"
                         for st, names in sorted(by_start.items())]
+                note = (f"\n* only if they joined before {_fmt_day(cutoff)} (check the "
+                        "exact date)" if cutoff and any("*" in n for ns in by_start.values()
+                                                      for n in ns) else "")
                 if telegram_send(cfg, "🗓 <b>Sporting sale windows</b> — " + link + "\n"
-                                 + "\n".join(rows) + f"\n\nI'll remind you {REMIND_BEFORE_MIN} "
+                                 + "\n".join(rows) + note + f"\n\nI'll remind you {REMIND_BEFORE_MIN} "
                                  "min before and when each window opens.",
                                  preview=False, chats=[cid]):
                     sent[plan_key] = now.isoformat()
@@ -2925,6 +2980,38 @@ def poll_access_requests(cfg: Config, wait: int = 0) -> None:
     cfg.subscribers = list(state["subscribers"])
     save_state(cfg.state_file, state)
     set_output("state_changed", "true")
+
+
+def run_export(cfg: Config) -> int:
+    """Send the bot's state and settings to the owner's Telegram as files, to
+    move the bot to another computer (owner only: it holds the bot token,
+    subscribers and their settings)."""
+    if not cfg.telegram_token or not cfg.telegram_chat:
+        print("Telegram not configured.")
+        return 1
+    files = []
+    if os.path.exists(cfg.state_file):
+        with open(cfg.state_file, "rb") as fh:
+            files.append(("state.json", fh.read()))
+    files.append(("bot.env", (
+        "# Settings for running the ticket bot on your own computer.\n"
+        "# Keep this file private: anyone with the token controls the bot.\n"
+        f"TELEGRAM_BOT_TOKEN={cfg.telegram_token}\n"
+        f"TELEGRAM_CHAT_ID={','.join(cfg.telegram_chats)}\n").encode()))
+    ok = True
+    for name, data in files:
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{cfg.telegram_token}/sendDocument",
+                data={"chat_id": cfg.telegram_chat,
+                      "caption": f"🧳 {name} - for moving the bot to your computer"},
+                files={"document": (name, data)}, timeout=60)
+            ok = ok and resp.status_code == 200
+        except requests.RequestException as err:
+            log.error("Export of %s failed: %s", name, err)
+            ok = False
+    print("Exported to the owner's Telegram." if ok else "Export FAILED.")
+    return 0 if ok else 1
 
 
 def run_test(cfg: Config) -> int:
@@ -3105,6 +3192,7 @@ def _process_source(cfg: Config, src: "Source", state: dict,
         if ev.phases:  # who may buy when: for the personal sale windows
             phases_store[key] = {"source": src.id, "title": ev.title, "url": ev.url,
                                  "date": ev.date or "", "phases": ev.phases,
+                                 "admitted_before": getattr(ev, "_cutoff", None),
                                  "start": ev.start.isoformat() if ev.start else None}
             dirty = True
         elif key in phases_store:
@@ -3286,6 +3374,8 @@ def _should_rotate(state: dict, elapsed_min: float) -> str:
     is down for everyone); never more often than every
     ROTATE_MIN_ELAPSED_MIN, so a real site outage can't cause a restart storm.
     """
+    if os.environ.get("LOCAL_RUN"):
+        return ""  # own computer: one IP, nothing to switch to
     if elapsed_min < ROTATE_MIN_ELAPSED_MIN:
         return ""
     kinds = state.get("fail_kind") or {}
@@ -3436,7 +3526,8 @@ def _maybe_alert_failure(cfg: Config, src: "Source", n: int, err: Exception) -> 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="FPF ticket monitor")
     parser.add_argument("--mode",
-                        choices=("normal", "diagnostic", "test", "chatid", "probe"),
+                        choices=("normal", "diagnostic", "test", "chatid", "probe",
+                                 "export"),
                         default="normal")
     parser.add_argument("--loop-minutes", type=float, default=0,
                         help="normal mode: keep running this long, checking "
@@ -3460,6 +3551,11 @@ def main(argv: list[str] | None = None) -> int:
         return run_chatid(cfg)
     if args.mode == "test":
         return run_test(cfg)
+    if args.mode == "export":
+        return run_export(cfg)
+    if os.environ.get("GITHUB_ACTIONS") and os.path.exists("RUN_LOCALLY"):
+        print("RUN_LOCALLY is set: the bot runs on the owner's computer, not here.")
+        return 0
     if args.loop_minutes > 0:
         return run_loop(cfg, args.loop_minutes)
     return run_normal(cfg)

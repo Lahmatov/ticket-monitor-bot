@@ -16,7 +16,7 @@ on:
         description: "Run mode"
         type: choice
         default: normal
-        options: [normal, diagnostic, test, chatid, probe]
+        options: [normal, diagnostic, test, chatid, probe, export]
       probe_url:
         description: "In probe mode: GET this URL (comma-separated) and dump response"
         type: string
@@ -116,7 +116,8 @@ jobs:
       # GitHub's cron. Skipped when the run was cancelled, so cancelling a run
       # (or disabling the workflow) stops the chain.
       - name: Start next loop run
-        if: (success() || failure()) && env.IS_LOOP == 'true'
+        # Not when RUN_LOCALLY exists: then the bot runs on the owner's computer.
+        if: (success() || failure()) && env.IS_LOOP == 'true' && hashFiles('RUN_LOCALLY') == ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run monitor.yml --ref "${{ github.ref_name }}" -f mode=normal
@@ -124,7 +125,7 @@ jobs:
       # Scheduled workflows are auto-disabled after 60 days without commits;
       # re-enabling keeps the safety-net cron alive.
       - name: Keep schedule enabled
-        if: env.IS_LOOP == 'true'
+        if: env.IS_LOOP == 'true' && hashFiles('RUN_LOCALLY') == ''
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
